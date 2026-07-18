@@ -966,8 +966,43 @@ async function pollLog() {
 }
 
 // ---------- 账号 ----------
+let accountsLoading = false;
+let planStatusLoading = false;
+let planStatusRevision = '';
 async function loadAccounts() {
+  if (accountsLoading) return;
+  accountsLoading = true;
   try { ACCOUNTS = await api('/api/accounts?limit=2000'); renderAccounts(); } catch(e) {}
+  finally { accountsLoading = false; }
+}
+async function pollAccountPlanStatuses() {
+  if (planStatusLoading || accountsLoading) return;
+  planStatusLoading = true;
+  try {
+    const snapshot = await api('/api/accounts/plan-check-status?limit=2000');
+    const items = snapshot.items || [];
+    const accountById = new Map(ACCOUNTS.map(r => [Number(r.id), r]));
+    const hasUnknown = items.some(item => !accountById.has(Number(item.id)));
+    if (hasUnknown || items.length !== ACCOUNTS.length) {
+      planStatusRevision = snapshot.revision || '';
+      await loadAccounts();
+      return;
+    }
+    if ((snapshot.revision || '') !== planStatusRevision) {
+      let needsFullReload = false;
+      items.forEach(item => {
+        const account = accountById.get(Number(item.id));
+        const wasChecking = ['queued', 'running'].includes(account?.plan_check_status);
+        const isChecking = ['queued', 'running'].includes(item.plan_check_status);
+        if (wasChecking && !isChecking) needsFullReload = true;
+        Object.assign(account, item);
+      });
+      planStatusRevision = snapshot.revision || '';
+      if (needsFullReload) await loadAccounts();
+      else renderAccounts();
+    }
+  } catch(e) {}
+  finally { planStatusLoading = false; }
 }
 function _codexCell(r) {
   const s = r.codex_status || '';
@@ -1020,10 +1055,27 @@ function _planCell(r) {
     route === 'direct_fallback' ? `网络: 直连回退${r.plan_check_proxy_fallback_reason ? ` (${r.plan_check_proxy_fallback_reason})` : ''}` :
     route === 'direct' ? '网络: 直连' : '';
   const title = [err ? esc(err) : checked, routeLabel].filter(Boolean).join('；');
-  if (err && ok === false) return `<span class="pill status-failed" title="${title}">查询失败</span>`;
+  if (['queued','running'].includes(r.plan_check_status)) {
+    const automatic = r.plan_check_trigger === 'registration_auto';
+    const queued = r.plan_check_status === 'queued';
+    const label = automatic ? (queued ? '自动查询排队中' : '自动查询中') : (queued ? '查询排队中' : '查询中');
+    const stamp = queued ? r.plan_check_queued_at : r.plan_check_started_at;
+    const detail = stamp ? `${queued ? '入队' : '开始'}: ${esc(stamp)}` : '';
+    return `<span class="pill status-running" title="${detail}">${label}</span>`;
+  }
+  if (err && ok === false) {
+    const hasLastSuccess = Boolean(r.plan_last_success_at);
+    const lastPlan = hasLastSuccess ? `${plan}${r.plus_trial_eligible ? '/可Plus试用' : ''}` : '';
+    const lastText = lastPlan ? `（上次: ${lastPlan}）` : '';
+    const lastTitle = hasLastSuccess ? `上次成功: ${esc(r.plan_last_success_at)}` : '';
+    return `<span class="pill status-failed" title="${[title, lastTitle].filter(Boolean).join('；')}">查询失败${esc(lastText)}</span>`;
+  }
   const lower = plan.toLowerCase();
 
   if (lower === 'free') {
+    if (!r.plan_checked_at && ok !== true) {
+      return `<span class="pill status-running" title="${title}">${esc(plan)}（待查资格）</span>`;
+    }
     const text = r.plus_trial_eligible ? 'free(可Plus试用)' : 'free';
     const cls = r.plus_trial_eligible ? 'status-success' : 'status-used';
     const t = r.plus_trial_eligible ? `${title}；Plus 试用资格可用` : title;
@@ -1050,6 +1102,12 @@ function _planCell(r) {
   return `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
 }
 function _planAction(r) {
+  if (['queued','running'].includes(r.plan_check_status)) {
+    const automatic = r.plan_check_trigger === 'registration_auto';
+    const queued = r.plan_check_status === 'queued';
+    const label = automatic ? (queued ? '自动查询排队中…' : '自动查询中…') : (queued ? '查询排队中…' : '查询中…');
+    return `<button data-plan-check="${esc(r.id)}" disabled title="套餐查询正在执行，完成后可再次查询">${label}</button>`;
+  }
   return `<button data-plan-check="${esc(r.id)}" title="查询当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>`;
 }
 function _codexAction(r) {
@@ -1249,17 +1307,11 @@ async function checkOnePlan(id, btn) {
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({account_id: id}),
     });
-    const ret = r.result || {};
-    if (ret.ok) {
-      const trial = ret.plus_trial_eligible ? '，有 Plus 试用资格' : '';
-      const route = ret.network_route === 'proxy' ? '代理' : ret.network_route === 'direct_fallback' ? '直连回退' : '直连';
-      showToast(`套餐：${ret.current_plan_type || '-'}${trial}（${route}）`);
-    } else {
-      showToast('查询失败: ' + (ret.error || 'unknown'));
-    }
-    await loadAccounts();
+    showToast(r.message || '套餐查询已加入后台队列');
+    await pollAccountPlanStatuses();
   } catch(err) {
-    showToast('查询失败: ' + err.message);
+    showToast(err.message);
+    await pollAccountPlanStatuses();
     btn.disabled = false;
     btn.textContent = old;
   }
@@ -1280,10 +1332,10 @@ async function checkSelectedPlans() {
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({account_ids: ids, workers}),
     });
-    const trialCount = (r.checked || []).filter(x => x.plus_trial_eligible).length;
     const failed = r.failed_count || 0;
-    showToast(`已查询 ${r.checked_count || 0} 个，成功 ${r.ok_count || 0}，Plus试用 ${trialCount}，失败 ${failed}`);
-    await loadAccounts();
+    const busy = r.busy_count || 0;
+    showToast(`已入队 ${r.started_count || 0} 个，查询中跳过 ${busy} 个，入队失败 ${failed} 个`);
+    await pollAccountPlanStatuses();
   } catch(err) {
     showToast('批量查询失败: ' + err.message);
     updateAccountSelectionUi();
@@ -2098,6 +2150,7 @@ loadSummary();
 activateTab(localStorage.getItem('gpt_console_active_tab') || 'register', false);
 jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidden')) refreshJobs(); }, 3000);
 setInterval(loadSummary, 5000);
+setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 2000);
 </script>
 </body>
 </html>
