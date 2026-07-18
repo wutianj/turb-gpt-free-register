@@ -26,6 +26,26 @@ from core.humanize import delay as human_delay
 
 logger = logging.getLogger(__name__)
 
+_LOG_CONTEXT = threading.local()
+
+
+def _log_provider_label() -> str:
+    return str(getattr(_LOG_CONTEXT, "provider_label", "BrowserUse") or "BrowserUse")
+
+
+def _set_log_provider_label(label: str) -> None:
+    _LOG_CONTEXT.provider_label = label or "BrowserUse"
+
+
+class _CloudProviderLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        label = _log_provider_label()
+        if label != "BrowserUse" and isinstance(record.msg, str):
+            record.msg = record.msg.replace("[BrowserUse]", f"[{label}]").replace("BrowserUse", label)
+        return True
+
+
+logger.addFilter(_CloudProviderLogFilter())
 
 
 def _fast_mode() -> bool:
@@ -1157,7 +1177,7 @@ def _finish_consent_workspace(context, page) -> str:
     return _wait_for_callback(context, page, timeout=5)
 
 
-def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str | None = None, force: bool = False) -> dict:
+def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:
     from core import codex_oauth as proto
     if not force and not proto._cfg.ENABLE_CODEX_AUTO:
         return proto._codex_result(status="skipped", message="ENABLE_CODEX_AUTO=False")
@@ -1171,8 +1191,17 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
     except ImportError as exc:
         return proto._codex_result(status="failed", email=email, message="缺少 playwright，请执行 pip install playwright")
 
-    _t_all = _StepTimer("Codex BrowserUse 全流程")
-    client = BrowserUseClient()
+    provider = str(cloud_provider or "browser_use").strip().lower()
+    if provider in ("skyvern", "sv"):
+        from core.skyvern_client import SkyvernClient
+        provider_label = "Skyvern"
+        client = SkyvernClient()
+    else:
+        provider_label = "BrowserUse"
+        client = BrowserUseClient()
+
+    _set_log_provider_label(provider_label)
+    _t_all = _StepTimer(f"Codex {provider_label} 全流程")
     session_info = client.open_session()
     browser = None
     context = None
@@ -1189,7 +1218,8 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             auth_url = proto._build_authorize_url(state, code_challenge, prompt="login")
 
         logger.info(
-            "[Codex][BrowserUse] 开始授权：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
+            "[Codex][%s] 开始授权：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
+            provider_label,
             email,
             session_info.proxy_country_code or "-",
             session_info.profile_id or "-",
@@ -1197,7 +1227,10 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
         )
         with sync_playwright() as p:
             _t_cdp = _StepTimer("连接 Browser Use CDP")
-            browser = p.chromium.connect_over_cdp(session_info.connect_url)
+            connect_kwargs = {}
+            if provider in ("skyvern", "sv") and hasattr(client, "cdp_headers"):
+                connect_kwargs["headers"] = client.cdp_headers()
+            browser = p.chromium.connect_over_cdp(session_info.connect_url, **connect_kwargs)
             _t_cdp.done()
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
@@ -1243,12 +1276,25 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
         logger.debug("[Codex][BrowserUse] 失败详情", exc_info=True)
         return proto._codex_result(status="failed", email=email, message=f"{type(exc).__name__}: {str(exc)[:300]}")
     finally:
-        if not bool(getattr(_cfg, "BROWSER_USE_KEEP_BROWSER_OPEN", False)):
+        keep_open = bool(getattr(_cfg, "BROWSER_USE_KEEP_BROWSER_OPEN", False))
+        if provider in ("skyvern", "sv"):
+            try:
+                from config import skyvern as _skyvern_cfg
+                keep_open = bool(getattr(_skyvern_cfg, "SKYVERN_KEEP_BROWSER_OPEN", False))
+            except Exception:
+                keep_open = False
+        if not keep_open:
             try:
                 if browser is not None:
                     browser.close()
             except Exception:
                 pass
+            if provider in ("skyvern", "sv") and hasattr(client, "close_browser_session") and getattr(session_info, "session_id", ""):
+                try:
+                    client.close_browser_session(session_info.session_id)
+                except Exception:
+                    pass
+        _set_log_provider_label("BrowserUse")
 
 
 def _has_running_asyncio_loop() -> bool:
@@ -1289,7 +1335,7 @@ def _run_in_isolated_thread(fn, *args, **kwargs):
     return result_box.get("value")
 
 
-def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str | None = None, force: bool = False) -> dict:
+def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:
     """Browser Use Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
 
@@ -1303,7 +1349,7 @@ def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str 
                 max_rounds,
                 email,
             )
-        result = _run_browser_use_codex_oauth_once(email=email, otp_provider=otp_provider, proxy=proxy, force=force)
+        result = _run_browser_use_codex_oauth_once(email=email, otp_provider=otp_provider, proxy=proxy, force=force, cloud_provider=cloud_provider)
         last_result = result
         if result.get("ok"):
             return result
@@ -1317,7 +1363,7 @@ def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str 
     return proto._codex_result(status="failed", email=email, message="CPA callback 超时，重新授权失败")
 
 
-def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None = None, force: bool = False) -> dict:
+def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:
     """Browser Use Codex OAuth 入口。
 
     如果当前线程已经有 Playwright/asyncio loop（典型场景：BrowserUse 注册成功后
@@ -1331,5 +1377,6 @@ def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None
             otp_provider=otp_provider,
             proxy=proxy,
             force=force,
+            cloud_provider=cloud_provider,
         )
-    return _run_browser_use_codex_oauth_impl(email=email, otp_provider=otp_provider, proxy=proxy, force=force)
+    return _run_browser_use_codex_oauth_impl(email=email, otp_provider=otp_provider, proxy=proxy, force=force, cloud_provider=cloud_provider)

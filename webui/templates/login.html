@@ -23,7 +23,8 @@
       background: #fff;
       box-shadow: 0 18px 50px rgba(15, 23, 42, .14);
     }
-    h1 { margin: 0 0 14px; font-size: 22px; }
+    h1 { margin: 0 0 8px; font-size: 22px; }
+    .desc { margin: 0 0 14px; color: #667085; font-size: 13px; line-height: 1.45; }
     input {
       width: 100%;
       min-height: 42px;
@@ -31,6 +32,21 @@
       border-radius: 8px;
       padding: 9px 12px;
       font: inherit;
+    }
+    .remember {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 12px;
+      color: #667085;
+      font-size: 13px;
+      user-select: none;
+    }
+    .remember input {
+      width: auto;
+      min-height: auto;
+      margin: 0;
+      padding: 0;
     }
     button {
       width: 100%;
@@ -57,10 +73,25 @@
 <body>
   <form class="card" method="post" action="{{ login_url }}">
     <h1>授权码登录</h1>
+    <p class="desc">请输入启动命令或配置文件中设置的授权码。</p>
     {% if error %}<div class="err">{{ error }}</div>{% endif %}
-    <input name="auth_code" type="password" autocomplete="current-password" autofocus placeholder="授权码">
+    <input id="authCodeInput" name="auth_code" type="password" autocomplete="current-password" autofocus placeholder="授权码">
+    <label class="remember"><input id="rememberAuthCode" name="remember" type="checkbox" value="1">记住授权码</label>
     <input name="next" type="hidden" value="{{ next_url }}">
     <button type="submit">登录</button>
   </form>
+  <script>
+    (() => {
+      const key = 'webui_auth_code';
+      const input = document.getElementById('authCodeInput');
+      const remember = document.getElementById('rememberAuthCode');
+      const saved = localStorage.getItem(key) || '';
+      if (saved) { input.value = saved; remember.checked = true; }
+      document.querySelector('form').addEventListener('submit', () => {
+        if (remember.checked) localStorage.setItem(key, input.value || '');
+        else localStorage.removeItem(key);
+      });
+    })();
+  </script>
 </body>
 </html>

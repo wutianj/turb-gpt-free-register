@@ -6,6 +6,7 @@ import hmac
 import logging
 import os
 import secrets
+from datetime import timedelta
 from typing import Any
 
 from flask import Response, jsonify, redirect, render_template, request, session, url_for
@@ -47,6 +48,7 @@ def init_auth(app: Any, *, auth_code: str | None = None) -> str:
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        PERMANENT_SESSION_LIFETIME=timedelta(days=30),
     )
     return code
 
@@ -114,7 +116,9 @@ def register_auth_routes(app: Any) -> None:
             next_url = "/"
         if request.method == "POST":
             code = (request.form.get("auth_code") or "").strip()
+            remember = (request.form.get("remember") or "").strip().lower() in ("1", "true", "on", "yes")
             if code_is_valid(code):
+                session.permanent = remember
                 session[_SESSION_KEY] = True
                 return redirect(next_url)
             error = "授权码错误"

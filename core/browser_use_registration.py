@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import random
+import threading
 import string
 import time
 from datetime import date
@@ -27,6 +28,26 @@ from core.humanize import delay as human_delay
 
 logger = logging.getLogger(__name__)
 
+_LOG_CONTEXT = threading.local()
+
+
+def _log_provider_label() -> str:
+    return str(getattr(_LOG_CONTEXT, "provider_label", "BrowserUse") or "BrowserUse")
+
+
+def _set_log_provider_label(label: str) -> None:
+    _LOG_CONTEXT.provider_label = label or "BrowserUse"
+
+
+class _CloudProviderLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        label = _log_provider_label()
+        if label != "BrowserUse" and isinstance(record.msg, str):
+            record.msg = record.msg.replace("[BrowserUse]", f"[{label}]").replace("BrowserUse", label)
+        return True
+
+
+logger.addFilter(_CloudProviderLogFilter())
 
 
 def _fast_mode() -> bool:
@@ -1344,8 +1365,9 @@ def run_browser_use_registration(
     proxy: str | None = None,
     otp_code: str | None = None,
     batch_dir: Path | None = None,
+    cloud_provider: str = "browser_use",
 ) -> dict:
-    """Browser Use Cloud 注册入口。proxy 参数保留兼容，但默认使用 Browser Use 自带代理。"""
+    """Browser Use / Skyvern 云端浏览器注册入口。proxy 参数保留兼容。"""
     try:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
@@ -1353,8 +1375,19 @@ def run_browser_use_registration(
             "缺少 playwright。请先执行: uv pip install playwright --python .venv/bin/python"
         ) from exc
 
-    _t_all = _StepTimer("BrowserUse 注册全流程")
-    client = BrowserUseClient()
+    provider = str(cloud_provider or "browser_use").strip().lower()
+    if provider in ("skyvern", "sv"):
+        from core.skyvern_client import SkyvernClient
+        cloud_label = "Skyvern"
+        provider_prefix = "skyvern"
+        client = SkyvernClient()
+    else:
+        cloud_label = "BrowserUse"
+        provider_prefix = "browser_use"
+        client = BrowserUseClient()
+
+    _set_log_provider_label(cloud_label)
+    _t_all = _StepTimer(f"{cloud_label} 注册全流程")
     session_info_open = client.open_session()
     create_acknowledged = False
     openai_password: str | None = None
@@ -1363,7 +1396,8 @@ def run_browser_use_registration(
     page = None
 
     logger.info(
-        "[BrowserUse] 开始注册：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
+        "[%s] 开始注册：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
+        cloud_label,
         email,
         session_info_open.proxy_country_code or "-",
         session_info_open.profile_id or "-",
@@ -1372,9 +1406,12 @@ def run_browser_use_registration(
 
     try:
         with sync_playwright() as p:
-            logger.info("[BrowserUse] 连接 CDP ...")
-            _t_cdp = _StepTimer("连接 Browser Use CDP")
-            browser = p.chromium.connect_over_cdp(session_info_open.connect_url)
+            logger.info("[%s] 连接 CDP ...", cloud_label)
+            _t_cdp = _StepTimer(f"连接 {cloud_label} CDP")
+            connect_kwargs = {}
+            if provider_prefix == "skyvern" and hasattr(client, "cdp_headers"):
+                connect_kwargs["headers"] = client.cdp_headers()
+            browser = p.chromium.connect_over_cdp(session_info_open.connect_url, **connect_kwargs)
             _t_cdp.done()
             # Browser Use 通常已有默认 context/page
             if browser.contexts:
@@ -1385,8 +1422,15 @@ def run_browser_use_registration(
             page.set_default_timeout(_timeout_ms())
             page.set_default_navigation_timeout(_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
 
-            start_url = str(getattr(_cfg, "BROWSER_USE_START_URL", "https://chatgpt.com/auth/login") or "https://chatgpt.com/auth/login")
-            logger.info("[BrowserUse] 打开登录页：%s", start_url)
+            if provider_prefix == "skyvern":
+                try:
+                    from config import skyvern as _skyvern_cfg
+                    start_url = str(getattr(_skyvern_cfg, "SKYVERN_START_URL", "https://chatgpt.com/auth/login") or "https://chatgpt.com/auth/login")
+                except Exception:
+                    start_url = "https://chatgpt.com/auth/login"
+            else:
+                start_url = str(getattr(_cfg, "BROWSER_USE_START_URL", "https://chatgpt.com/auth/login") or "https://chatgpt.com/auth/login")
+            logger.info("[%s] 打开登录页：%s", cloud_label, start_url)
             _t_goto = _StepTimer("打开登录页")
             page.goto(start_url, wait_until="domcontentloaded")
             _t_goto.done(f"url={_page_url(page) or '-'}")
@@ -1517,6 +1561,12 @@ def run_browser_use_registration(
                     # Codex OAuth 会创建自己的授权 session。先关闭注册阶段的 Browser Use
                     # CDP 连接，避免注册浏览器继续占用远端会话/代理资源并干扰后续 OAuth。
                     _close_browser_use_session(browser, reason="即将执行 Codex OAuth")
+                    if provider_prefix == "skyvern" and hasattr(client, "close_browser_session") and getattr(session_info_open, "session_id", ""):
+                        try:
+                            client.close_browser_session(session_info_open.session_id)
+                            logger.info("[Skyvern] 已关闭注册 browser session：%s", session_info_open.session_id)
+                        except Exception as exc:
+                            logger.warning("[Skyvern] 关闭注册 browser session 失败：%s: %s", type(exc).__name__, str(exc)[:180])
                     browser = None
                     context = None
                     page = None
@@ -1537,15 +1587,16 @@ def run_browser_use_registration(
                 access_token=access_token,
                 totp_secret=totp_secret,
                 email_source=resolve_email_source(email),
-                proxy_used=proxy or f"browser_use:{session_info_open.proxy_country_code or 'default'}",
+                proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
                 batch_dir=batch_dir,
                 extra={
                     "user": session_info.get("user"),
                     "account": session_info.get("account"),
                     "expires": session_info.get("expires"),
-                    "browser_use": {
+                    provider_prefix: {
                         "proxy_country_code": session_info_open.proxy_country_code,
                         "profile_id": session_info_open.profile_id,
+                        "session_id": getattr(session_info_open, "session_id", ""),
                         "connect": session_info_open.raw,
                     },
                     "registration_password": openai_password,
@@ -1581,9 +1632,22 @@ def run_browser_use_registration(
         }
     finally:
         # CDP 远端会话：关闭 browser 连接；Browser Use 侧通常会随断开回收。
-        if not bool(getattr(_cfg, "BROWSER_USE_KEEP_BROWSER_OPEN", False)):
+        keep_open = bool(getattr(_cfg, "BROWSER_USE_KEEP_BROWSER_OPEN", False))
+        if provider_prefix == "skyvern":
+            try:
+                from config import skyvern as _skyvern_cfg
+                keep_open = bool(getattr(_skyvern_cfg, "SKYVERN_KEEP_BROWSER_OPEN", False))
+            except Exception:
+                keep_open = False
+        if not keep_open:
             try:
                 if browser is not None:
                     browser.close()
             except Exception:
                 pass
+            if provider_prefix == "skyvern" and 'client' in locals() and hasattr(client, "close_browser_session") and getattr(session_info_open, "session_id", ""):
+                try:
+                    client.close_browser_session(session_info_open.session_id)
+                except Exception:
+                    pass
+        _set_log_provider_label("BrowserUse")

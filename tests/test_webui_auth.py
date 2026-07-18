@@ -28,6 +28,11 @@ class WebUiAuthTests(unittest.TestCase):
         r = self.client.post("/api/jobs/cancel-pending", json={"auth_code": "test-auth"})
         self.assertEqual(r.status_code, 401)
 
+    def test_login_remember_sets_persistent_session(self):
+        r = self.client.post("/login", data={"auth_code": "test-auth", "next": "/", "remember": "1"})
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("Expires=", r.headers.get("Set-Cookie") or "")
+
     def test_login_sets_session_cookie(self):
         r = self.client.post("/login", data={"auth_code": "test-auth", "next": "/"})
         self.assertEqual(r.status_code, 302)
