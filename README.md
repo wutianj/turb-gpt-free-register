@@ -137,7 +137,13 @@ WebUI 启动后，除 `/login` 外所有页面和 `/api/*` 接口都会校验授
 WEBUI_AUTH_CODE=你的授权码
 ```
 
-授权码只从 `.env`/环境变量读取，不再通过命令行传入，避免明文出现在进程列表中。若未设置，启动时会在日志中生成并打印本次临时授权码。接口调用可使用登录后的 Cookie，或传 `X-Auth-Code: <授权码>` / `Authorization: Bearer <授权码>`。
+也可以启动时直接传入：
+
+```bash
+python web.py --auth-code 你的授权码
+```
+
+优先级：`--auth-code` > `.env`/环境变量。若都未设置，启动时会在日志中生成并打印本次临时授权码。接口调用可使用登录后的 Cookie，或传 `X-Auth-Code: <授权码>` / `Authorization: Bearer <授权码>`。
 
 `WEBUI_SESSION_SECRET` 可选；未设置时会从固定授权码派生稳定的 Session 签名密钥，修改授权码后已有登录会自动失效。
 

@@ -77,11 +77,15 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1", help="绑定地址，默认仅本地 127.0.0.1")
     parser.add_argument("--port", type=int, default=5000, help="端口，默认 5000")
     parser.add_argument("--open-browser", action="store_true", help="启动后自动打开浏览器")
+    parser.add_argument("--auth-code", default=None, help="WebUI 授权码；也可配置 .env: WEBUI_AUTH_CODE=...")
     parser.add_argument("--verbose", action="store_true", help="详细日志")
     args = parser.parse_args()
 
     _setup_logging(args.verbose)
     logger = logging.getLogger(__name__)
+
+    if args.auth_code:
+        os.environ["WEBUI_AUTH_CODE"] = args.auth_code
 
     try:
         instance_lock = _acquire_single_instance(args.port)
@@ -89,7 +93,7 @@ def main() -> None:
         logger.error(str(exc))
         raise SystemExit(2) from exc
 
-    app = create_app()
+    app = create_app(auth_code=args.auth_code)
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}"
     logger.info(f"WebUI 已启动：{url}")
     if is_generated_code():
