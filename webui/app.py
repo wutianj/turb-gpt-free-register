@@ -15,7 +15,7 @@ import threading
 
 from flask import Flask, Response, jsonify, render_template, request
 
-from core import codex_retry_service, db
+from core import codex_retry_service, db, plan_check_service
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -45,6 +45,9 @@ def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    recovered_plan_checks = db.recover_interrupted_plan_checks()
+    if recovered_plan_checks:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
 
     # ----------------------------------------------------------
     # 页面
@@ -93,6 +96,14 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=500, type=int)
         return jsonify(db.list_accounts(limit=limit))
 
+    @app.get("/api/accounts/plan-check-status")
+    def api_account_plan_check_status():
+        """套餐查询轻量状态，不返回 Token、邮箱密码等敏感字段。"""
+        limit = request.args.get("limit", default=5000, type=int)
+        snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)))
+        snapshot["queue"] = plan_check_service.queue_settings()
+        return jsonify(snapshot)
+
     @app.post("/api/accounts/<int:acc_id>/delete")
     def api_account_delete(acc_id: int):
         """删除一个已注册账号记录。只删除本地保存的账号/token记录，不改邮箱池状态。"""
@@ -135,9 +146,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/accounts/check-plan")
     def api_account_check_plan():
-        """查询单个账号当前套餐和 Plus 试用资格。Body {account_id|email, proxy?, timezone_offset_min?}"""
-        from core.chatgpt_plan import check_account_plan
-
+        """把单账号套餐查询加入后台队列。Body {account_id|email, proxy?, timezone_offset_min?}"""
         data = request.get_json(silent=True) or {}
         acc_id = data.get("account_id") or data.get("id")
         email = (data.get("email") or "").strip()
@@ -154,28 +163,30 @@ def create_app(auth_code: str | None = None) -> Flask:
         token = (acc.get("access_token") or "").strip()
         if not token:
             return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
-        result = check_account_plan(
-            token,
-            # 未传 proxy 时使用套餐查询独立网络策略；显式传值仍可覆盖。
+        account_id = int(acc.get("id"))
+        queued = plan_check_service.enqueue_account_plan_check(
+            account_id=account_id,
+            email=acc.get("email") or "",
+            access_token=token,
+            trigger="manual",
             proxy=data.get("proxy") if "proxy" in data else None,
             timezone_offset_min=str(data.get("timezone_offset_min") or "-"),
         )
-        db.update_account_plan_check(acc_id=int(acc.get("id")), result=result)
-        return jsonify({"ok": bool(result.get("ok")), "account_id": acc.get("id"), "email": acc.get("email"), "result": result})
+        if queued.get("busy"):
+            return jsonify({"ok": False, **queued}), 409
+        if not queued.get("accepted"):
+            return jsonify({"ok": False, **queued}), 503
+        return jsonify({"ok": True, "started": True, **queued}), 202
 
     @app.post("/api/accounts/check-plan-bulk")
     def api_accounts_check_plan_bulk():
-        """批量查询账号当前套餐和 Plus 试用资格。Body {account_ids:[...], workers?, proxy?, timezone_offset_min?}"""
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        from core.chatgpt_plan import check_account_plan
-
+        """批量把套餐查询加入统一后台队列。Body {account_ids:[...], proxy?, timezone_offset_min?}"""
         data = request.get_json(silent=True) or {}
         ids = data.get("account_ids") or data.get("ids") or []
         if not isinstance(ids, list) or not ids:
             return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
         if len(ids) > 500:
             return jsonify({"ok": False, "error": "单次最多查询 500 个账号"}), 400
-        workers = max(1, min(16, int(data.get("workers") or 3)))
         # 与单账号查询保持一致：未传时使用独立网络策略。
         proxy = data.get("proxy") if "proxy" in data else None
         timezone_offset_min = str(data.get("timezone_offset_min") or "-")
@@ -201,43 +212,36 @@ def create_app(auth_code: str | None = None) -> Flask:
                 continue
             items.append(acc)
 
-        def _one(acc: dict) -> dict:
-            result = check_account_plan(
-                acc.get("access_token") or "",
+        started = []
+        busy = []
+        failed = []
+        for acc in items:
+            queued = plan_check_service.enqueue_account_plan_check(
+                account_id=int(acc.get("id")),
+                email=acc.get("email") or "",
+                access_token=acc.get("access_token") or "",
+                trigger="manual_bulk",
                 proxy=proxy,
                 timezone_offset_min=timezone_offset_min,
             )
-            db.update_account_plan_check(acc_id=int(acc.get("id")), result=result)
-            return {
-                "id": acc.get("id"),
-                "email": acc.get("email"),
-                "ok": bool(result.get("ok")),
-                "plan": result.get("current_plan_type"),
-                "plus_trial_eligible": bool(result.get("plus_trial_eligible")),
-                "network_route": result.get("network_route"),
-                "proxy_fallback_reason": result.get("proxy_fallback_reason"),
-                "error": result.get("error"),
-            }
-
-        checked = []
-        if items:
-            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="plan-check") as ex:
-                futures = [ex.submit(_one, acc) for acc in items]
-                for fut in as_completed(futures):
-                    try:
-                        checked.append(fut.result())
-                    except Exception as exc:
-                        checked.append({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
-        ok_count = sum(1 for x in checked if x.get("ok"))
+            item = {"id": acc.get("id"), "email": acc.get("email"), **queued}
+            if queued.get("accepted"):
+                started.append(item)
+            elif queued.get("busy"):
+                busy.append(item)
+            else:
+                failed.append(item)
         return jsonify({
             "ok": True,
-            "checked": checked,
-            "checked_count": len(checked),
-            "ok_count": ok_count,
-            "failed_count": len(checked) - ok_count,
+            "started": started,
+            "started_count": len(started),
+            "busy": busy,
+            "busy_count": len(busy),
+            "failed": failed,
+            "failed_count": len(failed),
             "skipped": skipped,
             "skipped_count": len(skipped),
-        })
+        }), 202
 
     # ----------------------------------------------------------
     # 邮箱池
