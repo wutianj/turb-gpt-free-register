@@ -36,6 +36,7 @@ SECRET_ENV_KEYS: dict[str, str] = {
     "CPA_MANAGEMENT_KEY": "CPA 管理接口密钥",
     "SMS_API_KEY": "接码平台 API Key（如 GrizzlySMS）",
     "L_ADMIN_AUTH_CODE": "本地 L 接码服务 ADMIN_AUTH_CODE",
+    "H_ADMIN_AUTH_CODE": "本地 H 接码服务 ADMIN_AUTH_CODE",
 }
 
 

@@ -39,6 +39,7 @@ from core.humanize import delay as human_delay
 from core.openai_auth import (
     _is_transient_network_error,
     _extract_error_code,
+    detect_account_unusable_response_body,
     AccountUnusableError,
     request_sentinel_token,
     build_sentinel_header,
@@ -506,6 +507,12 @@ def _submit_email_otp(session: BrowserSession, code: str) -> None:
             raise AccountUnusableError(
                 f"[Codex] 账号已废（{error_code}）status={resp.status_code}: {(resp.text or '')[:200]}",
                 error_code=error_code,
+            )
+        body_error_code = detect_account_unusable_response_body(resp.text or "")
+        if body_error_code:
+            raise AccountUnusableError(
+                f"[Codex] 账号已废（{body_error_code}）status={resp.status_code}: {(resp.text or '')[:200]}",
+                error_code=body_error_code,
             )
         raise RuntimeError(
             f"[Codex] 邮箱 OTP 验证失败 status={resp.status_code}: {(resp.text or '')[:300]}"

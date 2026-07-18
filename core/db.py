@@ -312,7 +312,7 @@ def _render_static_viewer(outlook_rows: list[dict] | None = None, account_rows: 
     </div>
     <div class="table-wrap">
       <table>
-        <thead><tr><th>ID</th><th>邮箱</th><th>来源</th><th>Token</th><th>2FA</th><th>创建时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>ID</th><th>邮箱</th><th>来源</th><th>Token</th><th>备注</th><th>2FA</th><th>创建时间</th><th>操作</th></tr></thead>
         <tbody id="accountsBody"></tbody>
       </table>
     </div>
@@ -403,6 +403,7 @@ function render() {{
       <td><div class="main-cell">${{esc(r.email)}}</div><div class="sub-cell">${{esc(r.user_name || '-')}}</div></td>
       <td>${{esc(r.email_source || '-')}}</td>
       <td><span class="mono">${{esc(short(r.access_token || '', 42))}}</span></td>
+      <td title="${{esc(r.note || '')}}">${{r.note ? esc(short(r.note, 60)) : '<span class="muted">-</span>'}}</td>
       <td>${{r.totp_secret ? '已启用' : '<span class="muted">未启用</span>'}}</td>
       <td class="muted">${{esc(r.created_at || '-')}}</td>
       <td class="actions">${{btn('复制Token', r.access_token, 'primary')}} ${{btn('复制整行', r.copy_line, 'good')}}</td>
@@ -515,6 +516,8 @@ def _find_by_email(rows: list[dict], email: str) -> dict | None:
 
 def _decorate_account(row: dict) -> dict:
     out = dict(row)
+    out["note"] = out.get("note") or ""
+    out["note_updated_at"] = out.get("note_updated_at") or ""
     plan_status = out.get("plan_check_status")
     if plan_status in {"queued", "running"}:
         try:
@@ -866,6 +869,50 @@ def get_account_by_email(email: str) -> dict | None:
     with _LOCK:
         row = _find_by_email(_load_accounts(), email)
         return _decorate_account(row) if row else None
+
+
+def update_account_note(acc_id: int, note: str) -> bool:
+    """更新单个已注册账号备注。note 为空字符串时表示清空备注。"""
+    with _LOCK:
+        rows = _load_accounts()
+        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
+        if row is None:
+            return False
+        now = _now()
+        row["note"] = str(note or "")
+        row["note_updated_at"] = now
+        row["updated_at"] = now
+        _save_accounts(rows)
+        return True
+
+
+def update_accounts_note(account_ids: list[int] | None, note: str) -> tuple[list[dict], list[dict]]:
+    """
+    批量更新已注册账号备注。
+    返回 (updated, skipped)，updated/skipped 元素含 id/email。
+    """
+    ids = {int(x) for x in (account_ids or []) if str(x).strip().lstrip("-").isdigit()}
+    updated: list[dict] = []
+    skipped: list[dict] = []
+    with _LOCK:
+        rows = _load_accounts()
+        seen_ids: set[int] = set()
+        now = _now()
+        text = str(note or "")
+        for row in rows:
+            row_id = int(row.get("id") or 0)
+            if row_id not in ids:
+                continue
+            row["note"] = text
+            row["note_updated_at"] = now
+            row["updated_at"] = now
+            updated.append({"id": row_id, "email": row.get("email"), "note": text, "note_updated_at": now})
+            seen_ids.add(row_id)
+        for item in ids - seen_ids:
+            skipped.append({"id": item, "reason": "账号不存在"})
+        if updated:
+            _save_accounts(rows)
+    return updated, skipped
 
 
 def count_accounts() -> int:

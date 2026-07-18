@@ -44,6 +44,64 @@ _ACCOUNT_DEAD_CODES = frozenset({
     "account_banned",
 })
 
+_ACCOUNT_DEAD_TEXT_MARKERS = (
+    "account_deactivated",
+    "account_deleted",
+    "account_banned",
+    "account deactivated",
+    "account deleted",
+    "account banned",
+    "account has been deactivated",
+    "account has been deleted",
+    "account was deactivated",
+    "account was deleted",
+    "your account has been deactivated",
+    "your account has been deleted",
+    "your account was deactivated",
+    "your account was deleted",
+    "账号已停用",
+    "账号已禁用",
+    "账号已删除",
+    "账户已停用",
+    "账户已禁用",
+    "账户已删除",
+)
+
+
+def detect_account_unusable_text(text: str) -> str:
+    """从浏览器页面/异常文本里识别账号已废，返回规范 error_code；未命中返回空串。"""
+    low = str(text or "").lower()
+    for code in _ACCOUNT_DEAD_CODES:
+        if code in low:
+            return code
+    if any(marker in low for marker in _ACCOUNT_DEAD_TEXT_MARKERS):
+        if "delete" in low or "删除" in low:
+            return "account_deleted"
+        if "ban" in low or "封" in low:
+            return "account_banned"
+        return "account_deactivated"
+    return ""
+
+
+def detect_account_unusable_response_body(body: str) -> str:
+    """
+    按纯协议模式同源逻辑，从接口响应 JSON 的 error.code 识别账号已废。
+
+    这不是页面文字识别；用于浏览器/指纹浏览器拦截
+    /api/accounts/email-otp/validate 响应后，读取响应体里的结构化错误码。
+    """
+    try:
+        payload = json.loads(body or "")
+    except Exception:
+        return ""
+    err = payload.get("error") if isinstance(payload, dict) else None
+    code = ""
+    if isinstance(err, dict):
+        code = str(err.get("code") or "")
+    elif isinstance(payload, dict):
+        code = str(payload.get("code") or payload.get("error_code") or "")
+    return code if code in _ACCOUNT_DEAD_CODES else ""
+
 
 def _extract_error_code(resp) -> str:
     """从响应体 JSON 里抽 error.code（拿不到返回空串）。"""

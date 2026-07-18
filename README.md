@@ -122,6 +122,7 @@ cp .env.example .env
 - `CPA_MANAGEMENT_KEY`
 - `SMS_API_KEY`
 - `L_ADMIN_AUTH_CODE`
+- `H_ADMIN_AUTH_CODE`
 
 WebUI 配置页保存这些字段时会写入 `.env`（不是 config 源码）。
 
@@ -375,13 +376,19 @@ CODEX_OAUTH_DRIVER = "browser_use"  # 可选 protocol / roxy / cloak / browser_u
 接码配置在 `config/codex.py`：
 
 ```python
-SMS_PROVIDER = "l"        # 或 grizzly
-SMS_API_KEY = "你的key"
+SMS_PROVIDER = "l"        # 可选 grizzly / l / h
+SMS_API_KEY = "你的 GrizzlySMS key"  # 仅 GrizzlySMS 需要
 SMS_SERVICE = "openai"
 SMS_COUNTRY = "国家代码"
 SMS_MAX_RETRIES = 10
 SMS_CODE_WAIT = 120
 SMS_POLL_INTERVAL = 5
+
+# 若 SMS_PROVIDER="h"，H 固定复用：
+#   SMS_SERVICE -> H projectId
+#   SMS_COUNTRY -> H country
+H_API_BASE = "http://localhost:8788"
+H_ADMIN_AUTH_CODE = "你的H后台授权码"
 ```
 
 CPA 授权地址来源：

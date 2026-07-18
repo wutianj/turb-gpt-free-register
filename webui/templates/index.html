@@ -114,6 +114,7 @@
     .col-email { width: 260px; }
     .col-source { width: 96px; }
     .col-token { width: 220px; }
+    .col-note { width: 180px; }
     .col-small { width: 78px; }
     .col-plan { width: 82px; }
     .col-account { width: 180px; }
@@ -124,7 +125,8 @@
     .jobs-table .col-actions { width: 330px; }
     .accounts-table .col-token { width: 92px; }
     .accounts-table .col-plan { width: 340px; }
-    .accounts-table .col-actions { width: 360px; }
+    .accounts-table .col-note { width: 180px; }
+    .accounts-table .col-actions { width: 410px; }
     .accounts-table td:nth-child(6), .accounts-table th:nth-child(6) { overflow: visible; text-overflow: clip; }
     .outlook-table .col-actions { width: 220px; }
     .codex-table .col-actions { width: 260px; }
@@ -353,6 +355,7 @@
           </label>
           <button class="btn primary" id="btnCheckSelectedPlans" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查询选中套餐</button>
           <button class="btn primary" id="btnRetrySelectedCodex" disabled title="给选中的账号批量补跑 Codex 授权">批量补跑 Codex</button>
+          <button class="btn good" id="btnNoteSelectedAccounts" disabled title="给选中的账号统一设置备注，留空可清空备注">批量备注</button>
           <button class="btn good" id="btnCopySelectedLines" disabled title="复制选中账号的完整整行，每个账号一行">复制选中整行</button>
           <button class="btn" id="btnDeleteSelectedAccounts" disabled title="删除选中的本地账号/token记录">删除选中</button>
           <button class="btn primary" id="copyAllTokens">复制全部 Token</button>
@@ -361,10 +364,10 @@
       </div>
       <div class="table-wrap">
         <table class="accounts-table">
-          <colgroup><col class="col-check"><col class="col-id"><col class="col-email"><col class="col-source"><col class="col-token"><col class="col-plan"><col class="col-small"><col class="col-status"><col class="col-time"><col class="col-actions"></colgroup>
+          <colgroup><col class="col-check"><col class="col-id"><col class="col-email"><col class="col-source"><col class="col-token"><col class="col-plan"><col class="col-note"><col class="col-small"><col class="col-status"><col class="col-time"><col class="col-actions"></colgroup>
           <thead><tr>
             <th><input type="checkbox" id="accountsSelectAll" title="全选/取消全选当前页账号"></th>
-            <th>ID</th><th>邮箱</th><th>来源</th><th>Token</th><th>套餐</th><th>2FA</th><th>Codex</th><th>创建时间</th><th>操作</th>
+            <th>ID</th><th>邮箱</th><th>来源</th><th>Token</th><th>套餐</th><th>备注</th><th>2FA</th><th>Codex</th><th>创建时间</th><th>操作</th>
           </tr></thead>
           <tbody id="accountsBody"></tbody>
         </table>
@@ -1137,11 +1140,12 @@ function renderAccounts() {
       <td>${esc(r.email_source || '-')}</td>
       <td><span class="mono" title="${esc(r.access_token || '')}">${esc(short(r.access_token || '', 10))}</span></td>
       <td>${_planCell(r)}</td>
+      <td class="wrap" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="muted">-</span>'}</td>
       <td>${r.totp_secret ? '已启用' : '<span class="muted">未启用</span>'}</td>
       <td>${_codexCell(r)}</td>
       <td class="muted">${esc(r.created_at || '-')}</td>
-      <td class="actions">${cbtn('复制Token', r.access_token, 'primary')} ${cbtn('复制整行', r.copy_line, 'good')} ${_planAction(r)} ${_codexAction(r)} <button data-codex-log="${esc(r.email)}" title="查看该账号最近一次 Codex 补跑日志">补跑日志</button> <button class="danger" data-account-delete="${esc(r.id)}" data-email="${esc(r.email)}">删除</button></td>
-    </tr>`).join('') || '<tr><td colspan="10" class="muted">暂无账号</td></tr>';
+      <td class="actions">${cbtn('复制Token', r.access_token, 'primary')} ${cbtn('复制整行', r.copy_line, 'good')} <button data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button> ${_planAction(r)} ${_codexAction(r)} <button data-codex-log="${esc(r.email)}" title="查看该账号最近一次 Codex 补跑日志">补跑日志</button> <button class="danger" data-account-delete="${esc(r.id)}" data-email="${esc(r.email)}">删除</button></td>
+    </tr>`).join('') || '<tr><td colspan="11" class="muted">暂无账号</td></tr>';
   updateAccountSelectionUi(rows);
   _renderPager('accounts', total);
 }
@@ -1152,11 +1156,13 @@ function updateAccountSelectionUi(pageRows = null) {
   const retryBulkBtn = $('#btnRetrySelectedCodex');
   const checkPlanBtn = $('#btnCheckSelectedPlans');
   const copySelectedBtn = $('#btnCopySelectedLines');
+  const noteSelectedBtn = $('#btnNoteSelectedAccounts');
   if (hint) hint.textContent = `已选 ${ACCOUNT_SELECTED.size}`;
   if (bulkBtn) bulkBtn.disabled = ACCOUNT_SELECTED.size === 0;
   if (retryBulkBtn) retryBulkBtn.disabled = ACCOUNT_SELECTED.size === 0;
   if (checkPlanBtn) checkPlanBtn.disabled = ACCOUNT_SELECTED.size === 0;
   if (copySelectedBtn) copySelectedBtn.disabled = ACCOUNT_SELECTED.size === 0;
+  if (noteSelectedBtn) noteSelectedBtn.disabled = ACCOUNT_SELECTED.size === 0;
 
   const cbAll = $('#accountsSelectAll');
   if (!cbAll) return;
@@ -1213,6 +1219,12 @@ $('#accountsBody').addEventListener('click', async (e) => {
   const delBtn = e.target.closest('[data-account-delete]');
   if (delBtn) {
     await deleteAccount(Number(delBtn.dataset.accountDelete), delBtn.dataset.email, delBtn);
+    return;
+  }
+
+  const noteBtn = e.target.closest('[data-account-note]');
+  if (noteBtn) {
+    await editAccountNote(Number(noteBtn.dataset.accountNote), noteBtn);
     return;
   }
 
@@ -1281,6 +1293,7 @@ $('#accountsSelectAll').addEventListener('change', (e) => {
 });
 $('#btnDeleteSelectedAccounts').addEventListener('click', deleteSelectedAccounts);
 $('#btnCopySelectedLines').addEventListener('click', copySelectedAccountLines);
+$('#btnNoteSelectedAccounts').addEventListener('click', noteSelectedAccounts);
 $('#btnRetrySelectedCodex').addEventListener('click', retrySelectedCodex);
 $('#btnCheckSelectedPlans').addEventListener('click', checkSelectedPlans);
 
@@ -1375,6 +1388,50 @@ async function deleteSelectedAccounts() {
     loadAccounts(); loadSummary();
   } catch(err) {
     showToast('批量删除失败: ' + err.message);
+    updateAccountSelectionUi();
+  }
+}
+
+async function editAccountNote(id, btn) {
+  const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
+  if (!acc) { showToast('账号不存在'); return; }
+  const note = prompt(`设置账号备注（留空可清空）\n\n${acc.email || ('#' + id)}`, acc.note || '');
+  if (note === null) return;
+  if (note.length > 2000) { showToast('备注最多 2000 个字符'); return; }
+  btn.disabled = true;
+  try {
+    await api(`/api/accounts/${id}/note`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({note}),
+    });
+    showToast(note ? '备注已保存' : '备注已清空');
+    loadAccounts();
+  } catch(err) {
+    showToast('保存备注失败: ' + err.message);
+    btn.disabled = false;
+  }
+}
+
+async function noteSelectedAccounts() {
+  const ids = Array.from(ACCOUNT_SELECTED);
+  if (ids.length === 0) { showToast('请先选择账号'); return; }
+  const note = prompt(`给选中的 ${ids.length} 个账号设置统一备注（留空可清空）`, '');
+  if (note === null) return;
+  if (note.length > 2000) { showToast('备注最多 2000 个字符'); return; }
+  const btn = $('#btnNoteSelectedAccounts');
+  btn.disabled = true;
+  try {
+    const r = await api('/api/accounts/note-bulk', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({account_ids: ids, note}),
+    });
+    const skippedCount = (r.skipped || []).length;
+    showToast(skippedCount ? `已备注 ${r.updated_count || 0} 个，跳过 ${skippedCount} 个` : `已备注 ${r.updated_count || 0} 个`);
+    loadAccounts();
+  } catch(err) {
+    showToast('批量备注失败: ' + err.message);
     updateAccountSelectionUi();
   }
 }
@@ -1804,6 +1861,7 @@ $('#codexBody').addEventListener('click', async (e) => {
 // ---------- 配置 ----------
 let CONFIG_ACTIVE_GROUP = '';
 let CONFIG_EMAIL_ACTIVE_SECTION = '通用邮箱 / OTP';
+let CONFIG_SMS_ACTIVE_SECTION = '通用接码';
 
 function configGroups() {
   const groups = {};
@@ -1847,36 +1905,70 @@ function emailConfigSectionForKey(key) {
   return ['其他邮箱配置', ''];
 }
 
-function renderConfigFields(fields) {
-  if (CONFIG_ACTIVE_GROUP !== '邮箱 / OTP') return fields.map(renderConfigField).join('');
+
+function smsConfigSectionForKey(key) {
+  if (['SMS_PROVIDER','SMS_COUNTRY','SMS_SERVICE','SMS_MAX_RETRIES','SMS_CODE_WAIT'].includes(key)) {
+    return ['通用接码', '接码通道选择、国家/服务代码、等待和重试参数；H 通道可复用 SMS_SERVICE/SMS_COUNTRY 作为 projectId/country'];
+  }
+  if (key === 'SMS_API_KEY') return ['GrizzlySMS', 'GrizzlySMS 平台 API Key 配置'];
+  if (key.startsWith('H_')) return ['H 接码', 'H_API.md 本地 H 取号服务配置；项目ID/国家留空时复用通用字段'];
+  if (key.startsWith('L_')) return ['L 接码', 'L_API.md 本地 L 取号服务配置'];
+  return ['其他接码配置', ''];
+}
+
+function renderSectionedConfigFields(fields, activeSectionName, setActiveSection, sectionForKey, preferred, dataAttr) {
   const bySection = {};
   for (const f of fields) {
-    const [section, help] = emailConfigSectionForKey(f.key || '');
+    const [section, help] = sectionForKey(f.key || '');
     if (!bySection[section]) bySection[section] = {help, fields: []};
     bySection[section].fields.push(f);
   }
-  const preferred = ['通用邮箱 / OTP', 'GPTMail', 'MailNest', 'CloudMail', 'Outlook 邮箱池', 'Cloudflare 域名邮箱', '其他邮箱配置'];
   const sections = preferred.filter(x => bySection[x]).concat(Object.keys(bySection).filter(x => !preferred.includes(x)));
-  if (!sections.includes(CONFIG_EMAIL_ACTIVE_SECTION)) CONFIG_EMAIL_ACTIVE_SECTION = sections[0] || '';
+  if (!sections.includes(activeSectionName)) {
+    activeSectionName = sections[0] || '';
+    setActiveSection(activeSectionName);
+  }
   let html = `
     <div class="config-subtabs">
       ${sections.map(section => `
-        <button type="button" data-email-config-section="${esc(section)}" class="${section === CONFIG_EMAIL_ACTIVE_SECTION ? 'active' : ''}">
+        <button type="button" data-${dataAttr}="${esc(section)}" class="${section === activeSectionName ? 'active' : ''}">
           ${esc(section)} <span class="config-count">${bySection[section].fields.length}</span>
         </button>
       `).join('')}
     </div>
   `;
-  const current = bySection[CONFIG_EMAIL_ACTIVE_SECTION];
+  const current = bySection[activeSectionName];
   if (!current) return html;
-  html += configSubhead(CONFIG_EMAIL_ACTIVE_SECTION, current.help);
+  html += configSubhead(activeSectionName, current.help);
   for (const f of current.fields) {
     html += renderConfigField(f);
-    if (f.key === 'CLOUDMAIL_AUTH_TOKEN') {
-      html += renderCloudMailTokenTools();
-    }
+    if (f.key === 'CLOUDMAIL_AUTH_TOKEN') html += renderCloudMailTokenTools();
   }
   return html;
+}
+
+function renderConfigFields(fields) {
+  if (CONFIG_ACTIVE_GROUP === '邮箱 / OTP') {
+    return renderSectionedConfigFields(
+      fields,
+      CONFIG_EMAIL_ACTIVE_SECTION,
+      v => { CONFIG_EMAIL_ACTIVE_SECTION = v; },
+      emailConfigSectionForKey,
+      ['通用邮箱 / OTP', 'GPTMail', 'MailNest', 'CloudMail', 'Outlook 邮箱池', 'Cloudflare 域名邮箱', '其他邮箱配置'],
+      'email-config-section'
+    );
+  }
+  if (CONFIG_ACTIVE_GROUP === '接码平台') {
+    return renderSectionedConfigFields(
+      fields,
+      CONFIG_SMS_ACTIVE_SECTION,
+      v => { CONFIG_SMS_ACTIVE_SECTION = v; },
+      smsConfigSectionForKey,
+      ['通用接码', 'GrizzlySMS', 'H 接码', 'L 接码', '其他接码配置'],
+      'sms-config-section'
+    );
+  }
+  return fields.map(renderConfigField).join('');
 }
 
 function renderConfigTabs() {
@@ -2049,10 +2141,18 @@ $('#configTabs').addEventListener('click', (e) => {
 });
 
 $('#configForm').addEventListener('click', (e) => {
-  const btn = e.target.closest('[data-email-config-section]');
-  if (!btn) return;
-  CONFIG_EMAIL_ACTIVE_SECTION = btn.dataset.emailConfigSection;
-  renderConfigPanel();
+  const emailBtn = e.target.closest('[data-email-config-section]');
+  if (emailBtn) {
+    CONFIG_EMAIL_ACTIVE_SECTION = emailBtn.dataset.emailConfigSection;
+    renderConfigPanel();
+    return;
+  }
+  const smsBtn = e.target.closest('[data-sms-config-section]');
+  if (smsBtn) {
+    CONFIG_SMS_ACTIVE_SECTION = smsBtn.dataset.smsConfigSection;
+    renderConfigPanel();
+    return;
+  }
 });
 
 async function loadRoxyWorkspaces() {

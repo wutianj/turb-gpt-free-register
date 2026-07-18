@@ -143,6 +143,54 @@ def create_app(auth_code: str | None = None) -> Flask:
             "skipped": skipped,
         })
 
+    @app.post("/api/accounts/<int:acc_id>/note")
+    def api_account_note(acc_id: int):
+        """更新单个已注册账号备注。Body {note: "..."}，空字符串表示清空。"""
+        data = request.get_json(silent=True) or {}
+        note = str(data.get("note") or "")
+        if len(note) > 2000:
+            return jsonify({"ok": False, "error": "备注最多 2000 个字符"}), 400
+        updated = db.update_account_note(acc_id=acc_id, note=note)
+        if not updated:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        return jsonify({"ok": True, "updated": True, "id": acc_id, "note": note})
+
+    @app.post("/api/accounts/note-bulk")
+    def api_accounts_note_bulk():
+        """批量更新已注册账号备注。Body {account_ids: [...], note: "..."}，空字符串表示清空。"""
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        note = str(data.get("note") or "")
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 5000:
+            return jsonify({"ok": False, "error": "单次最多备注 5000 个账号"}), 400
+        if len(note) > 2000:
+            return jsonify({"ok": False, "error": "备注最多 2000 个字符"}), 400
+
+        account_ids = []
+        skipped = []
+        seen = set()
+        for raw in ids:
+            try:
+                acc_id = int(raw)
+            except (TypeError, ValueError):
+                skipped.append({"id": raw, "reason": "ID 非法"})
+                continue
+            if acc_id in seen:
+                continue
+            seen.add(acc_id)
+            account_ids.append(acc_id)
+        updated, db_skipped = db.update_accounts_note(account_ids=account_ids, note=note)
+        skipped.extend(db_skipped)
+        return jsonify({
+            "ok": True,
+            "updated": updated,
+            "updated_count": len(updated),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+        })
+
 
     @app.post("/api/accounts/check-plan")
     def api_account_check_plan():

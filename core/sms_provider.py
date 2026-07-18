@@ -10,6 +10,7 @@
 当前支持：
     - GrizzlySMS：GET 文本接口，文档 https://api.grizzlysms.com
     - L：本地 JSON 管理接口，文档 L_API.md
+    - H：本地 JSON 管理接口，文档 H_API.md
 
 价格相关：每取一个号、收到短信都会计费，所以：
     - 取号后若收不到短信，必须 cancel(8) 释放，避免白扣钱；
@@ -140,6 +141,90 @@ def _post_l_json(http: CurlSession, path: str, payload: dict) -> dict:
     return data
 
 
+def _h_url(path: str) -> str:
+    base = str(getattr(_cfg, "H_API_BASE", "") or "").strip()
+    if not base:
+        raise SmsProviderError("H_API_BASE 不能为空")
+    return urljoin(base.rstrip("/") + "/", path.lstrip("/"))
+
+
+def _h_headers() -> dict:
+    token = str(getattr(_cfg, "H_ADMIN_AUTH_CODE", "") or "").strip()
+    if not token:
+        raise SmsProviderError("H_ADMIN_AUTH_CODE 不能为空")
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def _post_h_json(http: CurlSession, path: str, payload: dict) -> dict:
+    resp = http.post(_h_url(path), headers=_h_headers(), data=json.dumps(payload))
+    text = (resp.text or "").strip()
+    try:
+        data = resp.json()
+    except Exception:
+        data = {}
+
+    if resp.status_code != 200:
+        msg = data.get("error") if isinstance(data, dict) else ""
+        raise SmsProviderError(f"H HTTP {resp.status_code}: {(msg or text)[:200]}")
+    if isinstance(data, dict) and data.get("error"):
+        error = str(data.get("error") or "")
+        raw = str(data.get("raw") or "")
+        combined = f"{error} {raw}".strip()
+        if "NO_BALANCE" in combined or "余额不足" in combined:
+            raise SmsNoBalanceError(f"H 余额不足：{combined}")
+        if "NO_NUMBERS" in combined or "暂无号码" in combined:
+            raise SmsNoNumbersError(f"H 暂无可用号码：{combined}")
+        raise SmsProviderError(f"H 请求失败：{combined}")
+    if not isinstance(data, dict):
+        raise SmsProviderError(f"H 响应不是 JSON 对象：{text[:200]}")
+    return data
+
+
+def _release_h_number(activation_id: str, http: CurlSession | None = None) -> dict:
+    """调用 H_API /api/admin/h/release 释放单个号码。"""
+    activation_id = str(activation_id or "").strip()
+    if not activation_id:
+        raise SmsProviderError("H release 缺少 id")
+    own_http = http is None
+    http = http or _http()
+    try:
+        data = _post_h_json(http, "/api/admin/h/release", {"id": activation_id})
+        failed = data.get("failed") if isinstance(data, dict) else None
+        if isinstance(failed, list) and failed:
+            detail = json.dumps(failed, ensure_ascii=False)[:300]
+            raise SmsProviderError(f"H release 失败 id={activation_id}: {detail}")
+        released = data.get("released", data.get("updated", 0)) if isinstance(data, dict) else 0
+        logger.info(f"[SMS:H] 已释放号码 id={activation_id}, released={released}")
+        _ACQUIRED_AT.pop(activation_id, None)
+        return data
+    finally:
+        if own_http:
+            http.close()
+
+
+def release_h_numbers(ids: list[str], http: CurlSession | None = None) -> dict:
+    """批量释放 H 号码。"""
+    ids = [str(x or "").strip() for x in (ids or []) if str(x or "").strip()]
+    if not ids:
+        raise SmsProviderError("H release 缺少 ids")
+    own_http = http is None
+    http = http or _http()
+    try:
+        data = _post_h_json(http, "/api/admin/h/release", {"ids": ids})
+        released = data.get("released", data.get("updated", 0)) if isinstance(data, dict) else 0
+        failed = data.get("failed") if isinstance(data, dict) else []
+        logger.info(f"[SMS:H] 批量释放号码完成 released={released}, failed={len(failed) if isinstance(failed, list) else 0}")
+        for activation_id in ids:
+            _ACQUIRED_AT.pop(activation_id, None)
+        return data
+    finally:
+        if own_http:
+            http.close()
+
+
 def _release_l_number(activation_id: str, http: CurlSession | None = None) -> dict:
     """调用 L_API /api/admin/l/release 释放单个号码。"""
     activation_id = str(activation_id or "").strip()
@@ -196,6 +281,14 @@ def _normalize_l_phone(phone: str) -> str:
     return phone
 
 
+def _normalize_h_phone(phone: str) -> str:
+    phone = _normalize_phone_digits(phone)
+    prefix = _normalize_phone_digits(getattr(_cfg, "H_PHONE_PREFIX", ""))
+    if prefix and phone and not phone.startswith(prefix):
+        return f"{prefix}{phone}"
+    return phone
+
+
 # ============================================================
 # 取号
 # ============================================================
@@ -240,6 +333,39 @@ def acquire_number(
                 raise SmsProviderError(f"L take-phone 响应缺少 item.id/item.phone：{str(data)[:200]}")
             _ACQUIRED_AT[activation_id] = time.time()
             logger.info(f"[SMS:L] 取号成功：id={activation_id}, phone=+{phone}")
+            return activation_id, phone
+
+        if _provider() == "h":
+            # H_API 使用 projectId + country；统一复用 SMS_SERVICE / SMS_COUNTRY，
+            # 避免接码平台之间出现重复的“服务/国家”配置。
+            project_id = str(service or _cfg.SMS_SERVICE).strip()
+            h_country = str(country or _cfg.SMS_COUNTRY).strip()
+            if not project_id:
+                raise SmsProviderError("H projectId 不能为空：请填写 SMS_SERVICE")
+            if not h_country:
+                raise SmsProviderError("H country 不能为空：请填写 SMS_COUNTRY")
+            payload = {
+                "projectId": project_id,
+                "country": h_country,
+            }
+            data = _post_h_json(http, "/api/admin/h/take-reusable-phone", payload)
+            item = data.get("item") or {}
+            activation_id = str(item.get("id") or "").strip()
+            raw_phone = str(item.get("phone") or "")
+            raw_prefix = str(getattr(_cfg, "H_PHONE_PREFIX", "") or "")
+            phone = _normalize_h_phone(raw_phone)
+            if raw_phone.strip() != phone or raw_prefix.strip():
+                logger.info(
+                    f"[SMS:H] 号码规范化：raw_phone={raw_phone!r}, "
+                    f"prefix={raw_prefix!r}, normalized=+{phone}"
+                )
+            if not activation_id or not phone:
+                raise SmsProviderError(f"H take-reusable-phone 响应缺少 item.id/item.phone：{str(data)[:200]}")
+            _ACQUIRED_AT[activation_id] = time.time()
+            logger.info(
+                f"[SMS:H] 取号成功：id={activation_id}, phone=+{phone}, "
+                f"reused={bool(data.get('reused'))}, duplicate={bool(data.get('duplicate'))}"
+            )
             return activation_id, phone
 
         params = {
@@ -325,6 +451,22 @@ def wait_for_sms_code(
                 time.sleep(interval)
                 continue
 
+            if provider == "h":
+                data = _post_h_json(http, "/api/admin/h/fetch-code", {"id": activation_id})
+                code = str(data.get("code") or "").strip()
+                raw = str(data.get("raw") or "").strip()
+                status = str((data.get("item") or {}).get("status") or "").strip()
+                if code:
+                    logger.info(f"[SMS:H] 第 {round_no} 轮收到验证码：{code}")
+                    return code
+                remaining = max(0, int(deadline - time.time()))
+                logger.info(
+                    f"[SMS:H] 第 {round_no} 轮未收到验证码，状态={status or raw or 'WAIT'}，"
+                    f"{interval}s 后重试（剩余 {remaining}s）"
+                )
+                time.sleep(interval)
+                continue
+
             text = _request_grizzly(http, {"action": "getStatus", "id": activation_id})
 
             if text.startswith("STATUS_OK:"):
@@ -372,6 +514,11 @@ def complete(activation_id: str, http: CurlSession | None = None) -> None:
     """标记激活完成（status=6）。失败只告警不抛，避免影响主流程。"""
     if _provider() == "l":
         logger.info(f"[SMS:L] 已完成 id={activation_id}")
+        _ACQUIRED_AT.pop(activation_id, None)
+        return
+    if _provider() == "h":
+        # H 成功 fetch-code 后后台会自动按多次收码策略重取；这里不 release。
+        logger.info(f"[SMS:H] 已完成 id={activation_id}")
         _ACQUIRED_AT.pop(activation_id, None)
         return
     try:
@@ -436,6 +583,13 @@ def cancel(activation_id: str, http: CurlSession | None = None, background: bool
             _release_l_number(activation_id, http=http)
         except Exception as exc:
             logger.warning(f"[SMS:L] 释放号码失败（不影响主流程）：id={activation_id}, {type(exc).__name__}: {exc}")
+            _ACQUIRED_AT.pop(activation_id, None)
+        return
+    if _provider() == "h":
+        try:
+            _release_h_number(activation_id, http=http)
+        except Exception as exc:
+            logger.warning(f"[SMS:H] 释放号码失败（不影响主流程）：id={activation_id}, {type(exc).__name__}: {exc}")
             _ACQUIRED_AT.pop(activation_id, None)
         return
 

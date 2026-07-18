@@ -11,6 +11,7 @@ from config import browser_use as _cfg
 from config import roxybrowser as _roxy_cfg
 from core import sms_provider
 from core.browser_use_client import BrowserUseClient
+from core.openai_auth import AccountUnusableError, detect_account_unusable_response_body
 from core.browser_use_registration import (
     _timeout_ms,
     _page_url,
@@ -563,9 +564,38 @@ def _looks_email_otp_page(page) -> bool:
         return False
 
 
-def _wait_after_email_submit(page, timeout: int = 45) -> str:
+def _install_account_dead_response_tracker(page) -> dict:
+    """监听浏览器里的 email-otp/validate 响应，用于识别账号已废。"""
+    tracker = {"code": "", "text": ""}
+    try:
+        def _on_response(resp):
+            try:
+                if "email-otp/validate" not in str(getattr(resp, "url", "")):
+                    return
+                text = ""
+                if int(getattr(resp, "status", 0) or 0) != 200:
+                    try:
+                        text = resp.text() or ""
+                    except Exception:
+                        text = ""
+                code = detect_account_unusable_response_body(text)
+                if code:
+                    tracker["code"] = code
+                    tracker["text"] = text[:500]
+                    logger.warning("[Codex][BrowserUse] email-otp/validate 响应识别账号已废：%s", code)
+            except Exception:
+                pass
+        page.on("response", _on_response)
+    except Exception:
+        pass
+    return tracker
+
+
+def _wait_after_email_submit(page, timeout: int = 45, dead_tracker: dict | None = None) -> str:
     end = time.time() + timeout
     while time.time() < end:
+        if dead_tracker and dead_tracker.get("code"):
+            return f"deactivated:{dead_tracker.get('code')}"
         url = _page_url(page).lower()
         if _is_callback_url(url):
             return "callback"
@@ -584,7 +614,7 @@ def _wait_after_email_submit(page, timeout: int = 45) -> str:
     return "unknown"
 
 
-def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str) -> None:
+def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_tracker: dict | None = None) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][BrowserUse] 打开授权地址")
     logger.info("[Codex][BrowserUse] 完整授权地址: %s", auth_url)
@@ -643,9 +673,12 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str) -> None:
             ],
             timeout_ms=4000,
         )
-        outcome = _wait_after_email_submit(page, timeout=30 if _fast_mode() else 45)
+        outcome = _wait_after_email_submit(page, timeout=30 if _fast_mode() else 45, dead_tracker=dead_tracker)
         _t_otp_submit.done(f"state={outcome}")
         logger.info("[Codex][BrowserUse] 邮箱 OTP 提交后状态：%s", outcome)
+        if str(outcome).startswith("deactivated:"):
+            error_code = str(outcome).split(":", 1)[1] or "account_deactivated"
+            raise AccountUnusableError(f"账号已废（{error_code}）", error_code=error_code)
         if outcome in ("accepted", "callback", "unknown"):
             return
         if attempt >= 3:
@@ -1236,8 +1269,9 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(_timeout_ms())
             page.set_default_navigation_timeout(_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
+            dead_tracker = _install_account_dead_response_tracker(page)
 
-            _fill_email_and_otp(page, email, otp_provider, auth_url)
+            _fill_email_and_otp(page, email, otp_provider, auth_url, dead_tracker=dead_tracker)
             _do_phone_verification_if_present(page)
             logger.info("[Codex][BrowserUse] 手机验证处理完成/无需处理，等待授权确认和 callback")
             _t_callback = _StepTimer("等待 consent/workspace/callback")
@@ -1271,6 +1305,13 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             path = proto._save_codex_credential(email, storage)
             _t_all.done("success")
             return proto._codex_result(status="success", ok=True, email=email, file_path=str(path), callback_url=callback_url)
+    except AccountUnusableError as exc:
+        logger.warning("[Codex][BrowserUse] 账号已废：%s，%s", email, exc.error_code)
+        return proto._codex_result(
+            status="deactivated",
+            email=email,
+            message=f"账号已废（{exc.error_code or 'account_deactivated'}）",
+        )
     except Exception as exc:
         logger.error("[Codex][BrowserUse] 授权失败：%s: %s", type(exc).__name__, exc)
         logger.debug("[Codex][BrowserUse] 失败详情", exc_info=True)

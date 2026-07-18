@@ -12,6 +12,7 @@ from config import roxybrowser as _roxy_cfg
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
 from core import sms_provider
+from core.openai_auth import AccountUnusableError, detect_account_unusable_response_body
 from core.roxybrowser_client import RoxyBrowserClient
 from core.roxy_registration import (
     _build_driver,
@@ -213,6 +214,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         _type_otp(driver, code)
         logger.info("[Codex][Browser] 已填写邮箱 OTP")
         human_delay("otp_input")
+        _install_email_otp_validate_hook(driver)
         clicked = _click_if_present(driver, [
             "button[type='submit']",
             "//button[contains(., 'Continue')]",
@@ -229,6 +231,9 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         logger.info("[Codex][Browser] 邮箱 OTP 提交后状态：%s", outcome)
         if outcome == "accepted":
             return
+        if str(outcome).startswith("deactivated:"):
+            error_code = str(outcome).split(":", 1)[1] or "account_deactivated"
+            raise AccountUnusableError(f"账号已废（{error_code}）", error_code=error_code)
 
         if otp_attempt >= max_otp_attempts:
             raise RuntimeError("Codex 邮箱验证码连续错误/过期，已达到最大重试次数")
@@ -271,6 +276,90 @@ def _wait_for_fresh_email_otp(otp_provider, email: str, after_ts: float, used_co
         )
         time.sleep(min(5, max(1, remaining)))
 
+
+def _install_email_otp_validate_hook(driver) -> None:
+    """
+    在页面内 hook fetch/XHR，捕获 email-otp/validate 的接口响应体。
+
+    指纹浏览器不能像纯协议模式一样直接拿 requests.Response，因此在提交邮箱 OTP 前
+    注入此 hook，后续只读取接口 JSON error.code，不靠页面文字判断废号。
+    """
+    script = r"""
+    (() => {
+      window.__codexEmailOtpValidateResponses = [];
+      if (window.__codexEmailOtpValidateHooked) return true;
+      window.__codexEmailOtpValidateHooked = true;
+      const hit = (url) => String(url || '').includes('/api/accounts/email-otp/validate');
+      const save = (url, status, body) => {
+        try {
+          if (!hit(url)) return;
+          window.__codexEmailOtpValidateResponses.push({
+            url: String(url || ''),
+            status: Number(status || 0),
+            body: String(body || '').slice(0, 2000),
+            ts: Date.now(),
+          });
+        } catch (e) {}
+      };
+      const origFetch = window.fetch;
+      if (origFetch) {
+        window.fetch = async function(input, init) {
+          const resp = await origFetch.apply(this, arguments);
+          try {
+            const url = (typeof input === 'string') ? input : (input && input.url);
+            if (hit(url)) {
+              resp.clone().text().then(t => save(url, resp.status, t)).catch(() => {});
+            }
+          } catch (e) {}
+          return resp;
+        };
+      }
+      const origOpen = XMLHttpRequest.prototype.open;
+      const origSend = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(method, url) {
+        this.__codexOtpValidateUrl = url;
+        return origOpen.apply(this, arguments);
+      };
+      XMLHttpRequest.prototype.send = function() {
+        try {
+          this.addEventListener('loadend', function() {
+            try {
+              if (hit(this.__codexOtpValidateUrl)) save(this.__codexOtpValidateUrl, this.status, this.responseText);
+            } catch (e) {}
+          });
+        } catch (e) {}
+        return origSend.apply(this, arguments);
+      };
+      return true;
+    })();
+    """
+    try:
+        driver.execute_script(script)
+    except Exception as exc:
+        logger.debug("[Codex][Browser] 注入 email-otp/validate 响应 hook 失败：%s", exc)
+
+
+def _read_email_otp_validate_dead_code(driver) -> str:
+    try:
+        rows = driver.execute_script("return window.__codexEmailOtpValidateResponses || [];") or []
+    except Exception:
+        return ""
+    if not isinstance(rows, list):
+        return ""
+    for row in reversed(rows):
+        if not isinstance(row, dict):
+            continue
+        code = detect_account_unusable_response_body(str(row.get("body") or ""))
+        if code:
+            logger.warning(
+                "[Codex][Browser] email-otp/validate 响应识别账号已废：code=%s status=%s",
+                code,
+                row.get("status"),
+            )
+            return code
+    return ""
+
+
 def _is_email_verification_page(driver) -> bool:
     try:
         url = str(driver.current_url or "").lower()
@@ -292,6 +381,9 @@ def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
     last_log = 0.0
     while time.time() < end:
         try:
+            dead_code = _read_email_otp_validate_dead_code(driver)
+            if dead_code:
+                return f"deactivated:{dead_code}"
             url = str(driver.current_url or "")
             if url != last_url:
                 logger.info("[Codex][Browser] 邮箱 OTP 后等待跳转：url=%s", url)
@@ -1130,6 +1222,13 @@ def _run_roxy_codex_oauth_once(
             file_path=str(path),
             callback_url=callback_url,
             message=f"{_codex_driver_name()} plan={id_claims.get('plan_type') or 'unknown'}",
+        )
+    except AccountUnusableError as exc:
+        logger.warning("[Codex][Browser] 账号已废：%s，%s", email, exc.error_code)
+        return proto._codex_result(
+            status="deactivated",
+            email=email,
+            message=f"账号已废（{exc.error_code or 'account_deactivated'}）",
         )
     except Exception as exc:
         logger.warning("[Codex][Browser] 失败：%s，%s: %s", email, type(exc).__name__, str(exc)[:240])

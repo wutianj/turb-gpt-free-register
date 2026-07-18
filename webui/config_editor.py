@@ -448,15 +448,15 @@ EDITABLE_FIELDS = [
 
     {
         "key": "SMS_PROVIDER", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "接码通道", "help": "grizzly 或 l；l 使用 L_API.md 定义的本地取号服务",
+        "label": "接码通道", "help": "grizzly / l / h；l 使用 L_API.md，h 使用 H_API.md 定义的本地取号服务",
     },
     {
         "key": "SMS_COUNTRY", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "国家代码", "help": "传给接码平台的 country；GrizzlySMS 常用：美国=187 / 葡萄牙=117 / 智利=151；L 通道按 L 后台配置填写",
+        "label": "国家代码", "help": "传给接码平台的 country；GrizzlySMS 常用：美国=187；H 通道作为 H_API.md 的 country",
     },
     {
         "key": "SMS_SERVICE", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "服务代码", "help": "传给接码平台的 service；GrizzlySMS OpenAI=dr；L 通道按 L 后台配置填写",
+        "label": "服务/项目代码", "help": "GrizzlySMS/L 作为 service；H 通道作为 H_API.md 的 projectId",
     },
     {
         "key": "SMS_MAX_RETRIES", "file": "codex.py", "type": "int", "group": "接码平台",
@@ -468,8 +468,21 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "SMS_API_KEY", "file": "codex.py", "type": "str", "group": "接码平台",
-        "label": "API 密钥", "help": "保存在 .env（SMS_API_KEY），不写回 config/*.py",
+        "label": "GrizzlySMS API密钥", "help": "GrizzlySMS 平台 API Key，保存在 .env（SMS_API_KEY），不写回 config/*.py",
         "storage": "env", "secret": True,
+    },
+    {
+        "key": "H_API_BASE", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "H API 地址", "help": "H 取号服务基础地址，例如 http://localhost:8788",
+    },
+    {
+        "key": "H_ADMIN_AUTH_CODE", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "H 授权码", "help": "保存在 .env（H_ADMIN_AUTH_CODE），不写回 config/*.py",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "H_PHONE_PREFIX", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "H 号码前缀", "help": "H 返回号码不含国家码时填写，例如美国 10 位本地号填 1；留空则不补",
     },
     {
         "key": "L_API_BASE", "file": "codex.py", "type": "str", "group": "接码平台",
