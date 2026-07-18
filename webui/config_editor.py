@@ -16,6 +16,7 @@ from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
+EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL"}
 
 
 # ============================================================
@@ -28,6 +29,17 @@ _CONFIG_DIR = _PROJECT_ROOT / "config"
 # ============================================================
 
 EDITABLE_FIELDS = [
+    # ---- WebUI 授权 ----
+    {
+        "key": "WEBUI_AUTH_CODE", "file": "codex.py", "type": "str", "group": "WebUI 授权",
+        "label": "WebUI 授权码", "help": "保存在 .env（WEBUI_AUTH_CODE）；启动也可传 python web.py --auth-code <code>。保存后重启 WebUI 生效",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "WEBUI_SESSION_SECRET", "file": "codex.py", "type": "str", "group": "WebUI 授权",
+        "label": "Session 签名密钥", "help": "可选，保存在 .env（WEBUI_SESSION_SECRET）；不填则每次启动随机生成",
+        "storage": "env", "secret": True,
+    },
     # ---- 功能开关 ----
     {
         "key": "ENABLE_CODEX_AUTO", "file": "codex.py", "type": "bool", "group": "功能开关",
@@ -112,7 +124,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "BROWSER_USE_SESSION_TIMEOUT", "file": "browser_use.py", "type": "int", "group": "Browser Use",
-        "label": "云端会话超时(秒)", "help": "传给 Browser Use connect URL 的 timeout；服务端有上限，程序会自动限制到 60-180，建议 180",
+        "label": "云端keepAlive(分钟)", "help": "传给 Browser Use connect URL 的 timeout/keepAlive；程序会自动限制到 1-240，建议 240",
     },
     {
         "key": "BROWSER_USE_FAST_MODE", "file": "browser_use.py", "type": "bool", "group": "Browser Use",
@@ -555,7 +567,11 @@ def get_config() -> list[dict]:
         fallback = _parse_value_from_source(source, key, field["type"])
 
         if key in env_file_values:
-            value = _coerce_raw_value(env_file_values[key], fallback, field["type"])
+            raw_env_value = env_file_values[key]
+            if field["type"] == "list_str_multiline" and key in EXPLICIT_EMPTY_LIST_KEYS and str(raw_env_value).strip() == "":
+                value = []
+            else:
+                value = _coerce_raw_value(raw_env_value, fallback, field["type"])
         elif os.getenv(key) is not None:
             value = _coerce_raw_value(os.getenv(key, ""), fallback, field["type"])
         else:
@@ -692,7 +708,7 @@ def _format_env_value(value, vtype: str) -> str:
         return repr(float(value))
     if vtype == "list_str_multiline":
         lines = _normalize_config_value(value, vtype)
-        return "\n".join(lines)
+        return "\n".join(lines) if lines else "[]"
     if vtype == "str":
         return _normalize_config_value(value, vtype)
     return "" if value is None else str(value)
