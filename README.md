@@ -219,7 +219,7 @@ CLOUDFLARE_AUTH_MODE=x-admin-auth
 CLOUDFLARE_DEFAULT_DOMAINS=你的收信域名.com
 ```
 
-匿名模式可将 `CLOUDFLARE_AUTH_MODE=none` 且 Key 留空，创建路径默认 `/api/new_address`；若被 Turnstile 拦截请改用 admin 模式。更多字段见 WebUI「配置 → 邮箱 / OTP」或 `.env.example`，设计说明见 `SPEC-cloudflare-temp-email.md`。
+匿名模式可将 `CLOUDFLARE_AUTH_MODE=none` 且 Key 留空，创建路径默认 `/api/new_address`；若被 Turnstile 拦截请改用 admin 模式。更多字段见 WebUI「配置 → 邮箱 / OTP」或 `.env.example`。
 
 #### Cloudflare 域名邮箱（`cloudflare_domain`）
 
