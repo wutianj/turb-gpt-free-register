@@ -15,6 +15,9 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email import policy
+from email.header import decode_header
+from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from typing import Any
 
@@ -201,6 +204,10 @@ def _request(
         payload = response.json()
     except ValueError as exc:
         text = (getattr(response, "text", "") or "")[:200]
+        if response.status_code >= 400:
+            raise CFTempMailError(
+                f"Cloudflare 请求失败 ({path}): HTTP {response.status_code}; {text}"
+            ) from exc
         raise CFTempMailError(
             f"Cloudflare 响应不是 JSON ({path}): HTTP {response.status_code}; {text}"
         ) from exc
@@ -314,13 +321,13 @@ def release_account(email: str, status: str = "available", note: str | None = No
 
 
 def _message_timestamp(item: dict) -> float | None:
+    """解析邮件时间。Worker 的 created_at 多为 UTC 且无时区后缀，必须按 UTC 解释。"""
     for key in ("timestamp", "created_at", "createdAt", "date", "receivedAt", "time"):
         raw = item.get(key)
         if raw is None or raw == "":
             continue
         if isinstance(raw, (int, float)):
             value = float(raw)
-            # 毫秒时间戳
             if value > 1e12:
                 value = value / 1000.0
             return value
@@ -333,7 +340,16 @@ def _message_timestamp(item: dict) -> float | None:
                 if value > 1e12:
                     value /= 1000.0
                 return value
-            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+            # 兼容 "2026-07-19 12:57:38" / ISO
+            normalized = text.replace("Z", "+00:00")
+            if "T" not in normalized and " " in normalized and "+" not in normalized[10:]:
+                # 无时区的空格分隔时间：按 UTC 处理（cloudflare_temp_email 常见）
+                dt = datetime.fromisoformat(normalized).replace(tzinfo=timezone.utc)
+            else:
+                dt = datetime.fromisoformat(normalized)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
         except ValueError:
             pass
         try:
@@ -383,14 +399,114 @@ def _message_addresses(item: dict) -> list[str]:
     return out
 
 
+def _decode_mime_header(value: str) -> str:
+    if not value:
+        return ""
+    parts = decode_header(value)
+    out: list[str] = []
+    for part, charset in parts:
+        if isinstance(part, bytes):
+            out.append(part.decode(charset or "utf-8", errors="replace"))
+        else:
+            out.append(str(part))
+    return "".join(out).strip()
+
+
+def _parse_raw_email(raw: str) -> dict[str, str]:
+    """把 cloudflare_temp_email 的 raw MIME 解析成 subject/from/text/html。"""
+    result = {"subject": "", "from": "", "text": "", "html": ""}
+    if not (raw or "").strip():
+        return result
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(raw.encode("utf-8", errors="replace"))
+    except Exception:
+        # 回退：至少从头部抠 Subject/From
+        for line in raw.splitlines():
+            low = line.lower()
+            if low.startswith("subject:") and not result["subject"]:
+                result["subject"] = _decode_mime_header(line.split(":", 1)[1].strip())
+            elif low.startswith("from:") and not result["from"]:
+                result["from"] = line.split(":", 1)[1].strip()
+        result["text"] = raw
+        return result
+
+    result["subject"] = _decode_mime_header(str(msg.get("subject") or ""))
+    result["from"] = str(msg.get("from") or "").strip()
+    texts: list[str] = []
+    htmls: list[str] = []
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype not in ("text/plain", "text/html"):
+            continue
+        try:
+            body = part.get_content()
+        except Exception:
+            payload = part.get_payload(decode=True) or b""
+            charset = part.get_content_charset() or "utf-8"
+            body = payload.decode(charset, errors="replace")
+        if not isinstance(body, str):
+            body = str(body)
+        if ctype == "text/plain":
+            texts.append(body)
+        else:
+            htmls.append(body)
+    result["text"] = "\n".join(texts).strip()
+    result["html"] = "\n".join(htmls).strip()
+    if not result["text"] and not result["html"]:
+        result["text"] = raw
+    return result
+
+
+def _standalone_otp_from_html(html: str) -> str | None:
+    """OpenAI 邮件常见：验证码单独占一行/单元格，如 >449759<。"""
+    if not html:
+        return None
+    # 去 style，减少 #353740 这类颜色误伤
+    cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.I | re.S)
+    for pattern in (
+        r">\s*(\d{6})\s*<",
+        r"(?m)^\s*(\d{6})\s*$",
+    ):
+        matches = re.findall(pattern, cleaned)
+        # 过滤明显颜色/追踪号语境在上层做；这里取最后一个独立码更接近正文 OTP
+        if matches:
+            return matches[-1]
+    return None
+
+
 def _otp_item(item: dict) -> dict:
-    text = _message_text(item)
+    raw = item.get("raw") if isinstance(item.get("raw"), str) else ""
+    parsed = _parse_raw_email(raw) if raw else {"subject": "", "from": "", "text": "", "html": ""}
+
+    sender = (
+        item.get("from")
+        or item.get("from_address")
+        or item.get("sender")
+        or item.get("source")  # cloudflare_temp_email 列表字段
+        or parsed.get("from")
+        or ""
+    )
+    subject = item.get("subject") or parsed.get("subject") or ""
+    text = item.get("text") or parsed.get("text") or ""
+    html = item.get("html") if isinstance(item.get("html"), str) else ""
+    if not html:
+        html = parsed.get("html") or ""
+
+    # 若只有 raw 且 MIME 解析失败，保留非 header 的文本兜底
+    if not text and not html and raw:
+        text = raw
+
+    # 独立 6 位码优先塞进 text 开头，帮助 extract_otp 命中正文 OTP 而非邮件头噪声
+    standalone = _standalone_otp_from_html(html) or _standalone_otp_from_html(text)
+    if standalone:
+        text = f"verification code {standalone}\n{text}"
+
     return {
         "id": item.get("id") or item.get("msgid") or item.get("mail_id"),
-        "from": item.get("from") or item.get("from_address") or item.get("sender") or "",
-        "subject": item.get("subject") or "",
+        "from": sender,
+        "subject": subject,
         "text": text,
-        "html": item.get("html") if isinstance(item.get("html"), str) else "",
+        "html": html,
         "to": ", ".join(_message_addresses(item)),
     }
 
@@ -399,12 +515,21 @@ def _message_id(item: dict) -> str:
     return str(item.get("id") or item.get("msgid") or item.get("mail_id") or "").strip()
 
 
-def list_messages(jwt: str) -> list[dict]:
+def list_messages(jwt: str, *, limit: int = 20, offset: int = 0) -> list[dict]:
+    """拉取收件箱。cloudflare_temp_email 的 /api/mails 要求有效 limit（否则 HTTP 400 Invalid limit）。"""
     path = _normalize_path(
         _cfg_str("CLOUDFLARE_PATH_MESSAGES", "/api/mails"),
         "/api/mails",
     )
-    payload = _request("GET", path, bearer_jwt=jwt)
+    # 与 grokRegister-cpa 对齐：limit/offset 为必填查询参数
+    safe_limit = max(1, min(100, int(limit or 20)))
+    safe_offset = max(0, int(offset or 0))
+    payload = _request(
+        "GET",
+        path,
+        bearer_jwt=jwt,
+        params={"limit": safe_limit, "offset": safe_offset},
+    )
     return _pick_list_payload(payload)
 
 
@@ -477,34 +602,55 @@ def fetch_latest_otp(
             time.sleep(interval)
             continue
 
+        if messages:
+            logger.debug("[Cloudflare] 本轮收件 %s 封", len(messages))
+
         for item in messages:
             addresses = _message_addresses(item)
-            if addresses and target_lower not in addresses and not any(target_lower == a for a in addresses):
-                # 列表里若带地址字段且不匹配则跳过
-                if not any(target_lower in a for a in addresses):
-                    continue
+            if addresses and not any(target_lower == a or target_lower in a for a in addresses):
+                continue
 
             detail = item
             msg_id = _message_id(item)
+            otp_probe = _otp_item(detail)
             # 列表字段不足时尝试详情
-            if not _message_text(item) or not looks_like_openai_email(_otp_item(item)):
+            if (not otp_probe.get("text") and not otp_probe.get("html")) or not looks_like_openai_email(otp_probe):
                 if msg_id:
                     fetched = get_message_detail(account.jwt, msg_id)
                     if fetched:
                         merged = dict(item)
                         merged.update(fetched)
                         detail = merged
+                        otp_probe = _otp_item(detail)
 
-            otp_item = _otp_item(detail)
+            otp_item = otp_probe
             if not looks_like_openai_email(otp_item):
+                logger.debug(
+                    "[Cloudflare] 跳过非 OpenAI 邮件 id=%s from=%s subject=%s",
+                    msg_id,
+                    str(otp_item.get("from") or "")[:80],
+                    str(otp_item.get("subject") or "")[:80],
+                )
                 continue
 
             ts = _message_timestamp(detail)
             if ts is not None and ts < after:
+                logger.info(
+                    "[Cloudflare] 跳过过旧邮件 id=%s ts=%s after=%s subject=%s",
+                    msg_id,
+                    int(ts),
+                    int(after),
+                    str(otp_item.get("subject") or "")[:60],
+                )
                 continue
 
             otp = extract_otp(otp_item)
             if not otp:
+                logger.info(
+                    "[Cloudflare] OpenAI 邮件未能抽取 6 位码 id=%s subject=%s",
+                    msg_id,
+                    str(otp_item.get("subject") or "")[:80],
+                )
                 continue
 
             message_key = msg_id or f"{otp_item.get('subject')}|{otp}|{ts}"
@@ -538,7 +684,12 @@ def fetch_latest_otp(
                 remaining,
             )
         else:
-            logger.info("[Cloudflare] 暂未收到 OpenAI 邮件，%ss 后重试（剩余 %ss）", interval, remaining)
+            logger.info(
+                "[Cloudflare] 暂未匹配到可用 OTP，%ss 后重试（剩余 %ss；本轮邮件数=%s）",
+                interval,
+                remaining,
+                len(messages),
+            )
         if remaining <= 0:
             break
         time.sleep(min(interval, max(1, remaining)))

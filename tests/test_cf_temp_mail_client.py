@@ -130,5 +130,53 @@ class CFTempMailClientTests(unittest.TestCase):
                 client.pick_account()
 
 
+    @patch("core.cf_temp_mail_client.requests.request")
+    def test_list_messages_sends_limit_offset(self, request_mock):
+        response = Mock(status_code=200)
+        response.json.return_value = {"results": []}
+        request_mock.return_value = response
+
+        with patch.object(client._email_cfg, "CLOUDFLARE_API_BASE", "https://mail.example.com", create=True), patch.object(
+            client._email_cfg, "CLOUDFLARE_PATH_MESSAGES", "/api/mails", create=True
+        ), patch.object(client._email_cfg, "CLOUDFLARE_AUTH_MODE", "none", create=True), patch.object(
+            client._email_cfg, "CLOUDFLARE_API_KEY", "", create=True
+        ), patch.object(client._email_cfg, "CLOUDFLARE_CUSTOM_AUTH", "", create=True):
+            client.list_messages("jwt-xyz")
+
+        args, kwargs = request_mock.call_args
+        self.assertEqual(args[0], "GET")
+        self.assertTrue(args[1].endswith("/api/mails"))
+        self.assertEqual(kwargs["params"]["limit"], 20)
+        self.assertEqual(kwargs["params"]["offset"], 0)
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer jwt-xyz")
+
+
+    def test_created_at_without_tz_is_utc(self):
+        from datetime import datetime, timezone
+        ts = client._message_timestamp({"created_at": "2026-07-19 12:57:38"})
+        expected = datetime(2026, 7, 19, 12, 57, 38, tzinfo=timezone.utc).timestamp()
+        self.assertAlmostEqual(ts, expected, places=0)
+
+    def test_otp_from_cloudflare_raw_openai_mail(self):
+        raw = (
+            "From: ChatGPT <noreply@tm.openai.com>\r\n"
+            "Subject: ChatGPT code\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "\r\n"
+            "<html><body><p>Your code</p>\n449759\n</body></html>\r\n"
+        )
+        item = {
+            "id": 77,
+            "source": "bounces+x@em7877.tm.openai.com",
+            "address": "user@beliefcode.online",
+            "raw": raw,
+            "created_at": "2026-07-19 12:57:38",
+        }
+        otp_item = client._otp_item(item)
+        from core.otp_utils import looks_like_openai_email, extract_otp
+        self.assertTrue(looks_like_openai_email(otp_item))
+        self.assertEqual(extract_otp(otp_item), "449759")
+
+
 if __name__ == "__main__":
     unittest.main()
