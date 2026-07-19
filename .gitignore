@@ -52,6 +52,11 @@ tools/_*.py
 # Sentinel runner 临时 challenge 文件
 sentinel-challenge-*.json
 
+# Sentinel 本地调试配置（可能含 Cookie/Bearer/Challenge）
+sentinel.config.json
+tools/sentinel.config.json
+sentinel/sentinel.config.json
+
 # 意外生成的本地目录
 -/
 

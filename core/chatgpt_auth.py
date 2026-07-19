@@ -5,7 +5,7 @@ ChatGPT Auth 模块
 """
 import json
 import logging
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, urlparse, parse_qs
 
 from core.session import BrowserSession
 from config import (
@@ -13,6 +13,35 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_authorize_context(authorize_url: str, session: BrowserSession, email: str) -> str:
+    """
+    对 NextAuth 返回的 authorize URL 做最后兜底：确保当前前端默认
+    login_or_signup 链路的上下文参数没有在重定向生成阶段丢失。
+    """
+    try:
+        parsed = urlparse(authorize_url)
+        if not parsed.netloc.endswith("auth.openai.com"):
+            return authorize_url
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        required = {
+            "ext-oai-did": session.device_id,
+            "auth_session_logging_id": session.auth_session_logging_id,
+            "ext-passkey-client-capabilities": "1111",
+            "screen_hint": "login_or_signup",
+            "login_hint": email,
+        }
+        changed = False
+        for key, value in required.items():
+            if not params.get(key):
+                params[key] = [value]
+                changed = True
+        if not changed:
+            return authorize_url
+        return parsed._replace(query=urlencode(params, doseq=True)).geturl()
+    except Exception:
+        return authorize_url
 
 
 def get_providers(session: BrowserSession) -> dict:
@@ -118,6 +147,7 @@ def signin_openai(session: BrowserSession, csrf_token: str, email: str) -> str:
     if not authorize_url:
         raise ValueError(f"[步骤3] 未获取到 authorize URL, 响应: {data}")
 
-    logger.info(f"[步骤3] 获取 authorize URL 成功")
-    logger.debug(f"[步骤3] URL: {authorize_url[:100]}...")
+    authorize_url = _ensure_authorize_context(authorize_url, session, email)
+    logger.info("[步骤3] 获取 authorize URL 成功，已确认 login_or_signup/oai-did 上下文")
+    logger.debug(f"[步骤3] URL: {authorize_url[:160]}...")
     return authorize_url

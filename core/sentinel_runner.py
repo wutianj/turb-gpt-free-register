@@ -22,7 +22,13 @@ from config import (
     USER_AGENT,
     CHROME_MAJOR,
     CHROME_FULL_VERSION,
-    SEC_CH_UA_PLATFORM,  # noqa: F401（保留给后续扩展）
+    SEC_CH_UA,
+    SEC_CH_UA_PLATFORM,
+    SEC_CH_UA_FULL_VERSION_LIST,
+    SEC_CH_UA_PLATFORM_VERSION,
+    SEC_CH_UA_ARCH,
+    SEC_CH_UA_BITNESS,
+    SEC_CH_UA_MODEL,
     TIMEZONE_IANA,
     NAVIGATOR_LANGUAGE,
     NAVIGATOR_LANGUAGES,
@@ -122,6 +128,13 @@ def generate_sentinel_token(
     navigator_languages = list(profile.get("navigator_languages", NAVIGATOR_LANGUAGES))
     chrome_major = str(profile.get("chrome_major", CHROME_MAJOR))
     chrome_full_version = str(profile.get("chrome_full_version", CHROME_FULL_VERSION))
+    sec_ch_ua = str(profile.get("sec_ch_ua", SEC_CH_UA))
+    sec_ch_ua_platform = str(profile.get("sec_ch_ua_platform", SEC_CH_UA_PLATFORM))
+    sec_ch_ua_full_version_list = str(profile.get("sec_ch_ua_full_version_list", SEC_CH_UA_FULL_VERSION_LIST))
+    sec_ch_ua_platform_version = str(profile.get("sec_ch_ua_platform_version", SEC_CH_UA_PLATFORM_VERSION))
+    sec_ch_ua_arch = str(profile.get("sec_ch_ua_arch", SEC_CH_UA_ARCH))
+    sec_ch_ua_bitness = str(profile.get("sec_ch_ua_bitness", SEC_CH_UA_BITNESS))
+    sec_ch_ua_model = str(profile.get("sec_ch_ua_model", SEC_CH_UA_MODEL))
     build_id = str(profile.get("build_id", OPENAI_BUILD_ID))
     timezone_iana = str(profile.get("timezone_iana", TIMEZONE_IANA))
 
@@ -168,6 +181,13 @@ def generate_sentinel_token(
             "--device-pixel-ratio", str(device_pixel_ratio),
             "--chrome-major", chrome_major,
             "--chrome-full-version", chrome_full_version,
+            "--sec-ch-ua", sec_ch_ua,
+            "--sec-ch-ua-platform", sec_ch_ua_platform,
+            "--sec-ch-ua-full-version-list", sec_ch_ua_full_version_list,
+            "--sec-ch-ua-platform-version", sec_ch_ua_platform_version,
+            "--sec-ch-ua-arch", sec_ch_ua_arch,
+            "--sec-ch-ua-bitness", sec_ch_ua_bitness,
+            "--sec-ch-ua-model", sec_ch_ua_model,
             "--no-cookie",
         ]
 

@@ -24,6 +24,8 @@ from core.openai_auth import (
     build_sentinel_header,
     validate_email_otp,
     send_email_otp,
+    network_preflight,
+    navigate_about_you,
     EmailOtpInvalidError,
     create_account,
 )
@@ -257,13 +259,9 @@ def run_registration(
 
     create_acknowledged = False
     try:
-        # 像真实用户一样先打开登录页，让 Cookie / 边缘节点 / 初始页面状态先建立起来。
-        try:
-            logger.info("[预热] 打开 ChatGPT 登录页...")
-            session.get("https://chatgpt.com/login", headers=session.get_chatgpt_navigate_headers(referer="https://chatgpt.com/"), allow_redirects=True)
-            human_delay("navigate")
-        except Exception as warm_exc:
-            logger.debug(f"[预热] 登录页预热失败，继续走 API 流程: {warm_exc}")
+        # 网络预检必须在 signin/follow_authorize 之前完成；预检不带邮箱，不会触发 OTP。
+        network_preflight(session)
+        human_delay("navigate")
 
         # ==================== 阶段1: ChatGPT 认证 ====================
         # 步骤1: 获取 providers
@@ -291,10 +289,8 @@ def run_registration(
         human_delay("navigate")
 
         # ==================== 阶段3: 验证码验证 ====================
-        # 步骤9: 获取 Sentinel Token（authorize_continue，用于验证码提交）
-        sentinel_resp_9 = request_sentinel_token(session, "authorize_continue")
-        sentinel_header_9, _ = build_sentinel_header(session, sentinel_resp_9, "authorize_continue")
-        human_delay("challenge")
+        # Sentinel Token 不提前生成；等 OTP 到手后紧贴 validate 请求生成，
+        # 避免等待邮箱期间 challenge 过期或与重新发送后的状态不一致。
 
         # 等待验证码：USE_EMAIL_SERVICE=True 时自动从 Outlook 取件，否则人工输入。
         # 如果验证码错误/过期，自动重新发送并重新取最新验证码。
@@ -313,8 +309,13 @@ def run_registration(
 
             human_delay("otp_input")
             try:
-                # 步骤10: 提交验证码（带 sentinel-token 头）
-                validate_result = validate_email_otp(session, current_otp, sentinel_header_9)
+                # 步骤9: 获取 Sentinel Token（authorize_continue），紧贴步骤10使用。
+                sentinel_resp_9 = request_sentinel_token(session, "authorize_continue")
+                sentinel_header_9, so_header_9 = build_sentinel_header(session, sentinel_resp_9, "authorize_continue")
+                human_delay("challenge")
+
+                # 步骤10: 提交验证码（带 sentinel-token + so-token 头）
+                validate_result = validate_email_otp(session, current_otp, sentinel_header_9, so_header_9)
                 break
             except EmailOtpInvalidError as exc:
                 if otp_attempt >= max_otp_attempts:
@@ -350,10 +351,20 @@ def run_registration(
         )
 
         # ==================== 阶段5/6: 完成注册或直接 OAuth 回调 ====================
-        if page_type == "external_url":
+        otp_continue_text = str(otp_continue_url or "")
+        direct_oauth_after_otp = bool(
+            otp_continue_text
+            and "about-you" not in otp_continue_text
+            and (
+                "chatgpt.com/api/auth/callback" in otp_continue_text
+                or "auth.openai.com/authorize/continue" in otp_continue_text
+                or page_type == "external_url"
+            )
+        )
+        if page_type == "external_url" or direct_oauth_after_otp:
             if not otp_continue_url:
                 raise RuntimeError(f"OTP external_url 响应缺少可跟随 URL，无法继续: {validate_result}")
-            logger.info(f"[注册] OTP 后进入 external_url，跳过 create_account，直接完成 OAuth 回调：{email}")
+            logger.info(f"[注册] OTP 后进入 OAuth 回调分支，跳过 create_account：{email}")
             create_acknowledged = True
             session_info, access_token = _finalize_registration_session(
                 session,
@@ -374,13 +385,10 @@ def run_registration(
                     f"[步骤10] 未知 page_type={page_type}，但 continue_url 指向 about-you，继续 create_account"
                 )
 
-            # 如果服务端显式给了 about-you URL，先导航一次，让 auth session 进入资料页状态。
-            if otp_continue_url and "about-you" in str(otp_continue_url):
-                logger.info("[步骤10.5] 跟随 about-you continue_url，进入资料页状态")
-                headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification")
-                resp = session.get(str(otp_continue_url), headers=headers, allow_redirects=True)
-                logger.info(f"[步骤10.5] about-you 导航完成，落点: {getattr(resp, 'url', '')}")
-                human_delay("navigate")
+            # 先真实导航到 about-you，让 auth session/page state 与 create_account 一致。
+            about_url = str(otp_continue_url) if otp_continue_url and "about-you" in str(otp_continue_url) else None
+            navigate_about_you(session, about_url)
+            human_delay("navigate")
 
             # 步骤11: 获取 Sentinel Token（oauth_create_account）
             sentinel_resp_11 = request_sentinel_token(session, "oauth_create_account")

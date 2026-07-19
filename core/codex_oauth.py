@@ -43,6 +43,7 @@ from core.openai_auth import (
     AccountUnusableError,
     request_sentinel_token,
     build_sentinel_header,
+    network_preflight,
 )
 from core import sms_provider
 from curl_cffi import requests as curl_requests
@@ -138,6 +139,29 @@ def _build_authorize_url(state: str, code_challenge: str, prompt: str = "login")
         "codex_cli_simplified_flow": "true",
     }
     return f"{_cfg.CODEX_AUTH_URL}?{urlencode(params)}"
+
+
+def _ensure_oai_context_url(auth_url: str, session: BrowserSession) -> str:
+    """在 Codex OAuth 授权 URL 上补齐前端同源上下文参数，保持 oai-did 连续。"""
+    try:
+        parsed = urlparse(auth_url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        changed = False
+        additions = {
+            "ext-oai-did": session.device_id,
+            "auth_session_logging_id": session.auth_session_logging_id,
+            "screen_hint": "login_or_signup",
+        }
+        for key, value in additions.items():
+            if not params.get(key):
+                params[key] = [value]
+                changed = True
+        if not changed:
+            return auth_url
+        query = urlencode(params, doseq=True)
+        return parsed._replace(query=query).geturl()
+    except Exception:
+        return auth_url
 
 
 # ============================================================
@@ -374,11 +398,13 @@ def _decode_jwt_segment(seg: str) -> dict:
 
 
 def _post_json(session: BrowserSession, url: str, payload: dict, referer: str,
-               sentinel_header: str | None = None):
+               sentinel_header: str | None = None, so_header: str | None = None):
     """统一发 /api/accounts/* 的 JSON POST。"""
     headers = session.get_auth_headers(referer=referer)
     if sentinel_header:
         headers["openai-sentinel-token"] = sentinel_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
     return session.post(url, headers=headers, data=json.dumps(payload), allow_redirects=False)
 
 
@@ -453,6 +479,7 @@ def _bootstrap_authorize(
         if not code_challenge:
             raise RuntimeError("[Codex] 本地生成授权地址需要 code_challenge")
         auth_url = _build_authorize_url(state, code_challenge, prompt="login")
+    auth_url = _ensure_oai_context_url(auth_url, session)
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
     logger.info("[Codex] 跟随 Codex authorize URL 建立会话...")
     logger.info(f"[Codex] 完整授权地址: {auth_url}")
@@ -470,7 +497,7 @@ def _bootstrap_authorize(
 def _submit_email(session: BrowserSession, email: str) -> None:
     """POST authorize/continue 提交邮箱，触发 OpenAI 发送邮箱 OTP。带 sentinel。"""
     sentinel_resp = request_sentinel_token(session, "authorize_continue")
-    sentinel_header, _ = build_sentinel_header(session, sentinel_resp, "authorize_continue")
+    sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "authorize_continue")
     payload = {"username": {"kind": "email", "value": email}}
     resp = _post_json(
         session,
@@ -478,6 +505,7 @@ def _submit_email(session: BrowserSession, email: str) -> None:
         payload,
         referer="https://auth.openai.com/log-in",
         sentinel_header=sentinel_header,
+        so_header=so_header,
     )
     if resp.status_code not in (200, 204):
         raise RuntimeError(
@@ -493,13 +521,14 @@ def _submit_email(session: BrowserSession, email: str) -> None:
 def _submit_email_otp(session: BrowserSession, code: str) -> None:
     """POST email-otp/validate 提交邮箱验证码。带 sentinel(authorize_continue)。"""
     sentinel_resp = request_sentinel_token(session, "authorize_continue")
-    sentinel_header, _ = build_sentinel_header(session, sentinel_resp, "authorize_continue")
+    sentinel_header, so_header = build_sentinel_header(session, sentinel_resp, "authorize_continue")
     resp = _post_json(
         session,
         "https://auth.openai.com/api/accounts/email-otp/validate",
         {"code": code},
         referer="https://auth.openai.com/email-verification",
         sentinel_header=sentinel_header,
+        so_header=so_header,
     )
     if resp.status_code != 200:
         error_code = _extract_error_code(resp)
@@ -1030,7 +1059,11 @@ def run_codex_oauth(
         else:
             raise RuntimeError(f"[Codex] 不支持的 CODEX_AUTH_URL_SOURCE={auth_source!r}")
 
-        # 2. 建立会话
+        # 2. 网络预检 + 建立会话。预检不携带邮箱，不触发 OTP；
+        #    真正烧邮箱的 authorize/continue 只在预检成功后执行。
+        network_preflight(session)
+        human_delay("navigate")
+
         _bootstrap_authorize(session, state, code_challenge, auth_url=auth_url)
         human_delay("navigate")
 

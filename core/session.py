@@ -4,6 +4,7 @@ curl_cffi Session 封装
 统一管理 Cookie、请求头和 TLS 指纹
 """
 import logging
+import random
 import threading
 import uuid
 from curl_cffi.requests import Session
@@ -52,6 +53,12 @@ class BrowserSession:
 
         # 生成 auth_session_logging_id
         self.auth_session_logging_id = str(uuid.uuid4())
+
+        # Datadog/RUM 关联 ID：每个 BrowserSession 独立生成，禁止跨账号复用。
+        # 只作为前端同形态诊断头，贯穿本会话内所有 auth/chatgpt/sentinel API 调用。
+        self.datadog_trace_id = str(random.getrandbits(63))
+        self.datadog_parent_id = str(random.getrandbits(63))
+        self.datadog_origin = "rum"
 
         # Sentinel SDK 内部 sid：真实 SDK 会单独生成一个 UUID，和 oai-did 不是同一个值。
         # Python 初始 p 与 Node Runner 最终 token 都复用这个 sid，保持同一 SDK 实例语义。
@@ -186,6 +193,32 @@ class BrowserSession:
             return "cross-site"
         return "none"
 
+    def get_datadog_headers(self) -> dict:
+        """获取当前会话稳定的 Datadog/RUM 关联头。"""
+        return {
+            "x-datadog-origin": self.datadog_origin,
+            "x-datadog-sampling-priority": "1",
+            "x-datadog-trace-id": self.datadog_trace_id,
+            "x-datadog-parent-id": self.datadog_parent_id,
+        }
+
+    def _attach_datadog_headers(self, headers: dict) -> dict:
+        """为前端 API 请求补齐 Datadog 头，降低无诊断头 silent-drop 概率。"""
+        headers.update(self.get_datadog_headers())
+        return headers
+
+    def _attach_oai_context_headers(self, headers: dict) -> dict:
+        """补齐同一设备上下文头，和 oai-did Cookie / OAuth ext-oai-did 保持一致。"""
+        headers["oai-device-id"] = self.device_id
+        headers["oai-language"] = self.navigator_language()
+        return headers
+
+    def _attach_frontend_api_headers(self, headers: dict) -> dict:
+        """前端 API 统一头：BrowserProfile + oai 上下文 + Datadog。"""
+        self._attach_oai_context_headers(headers)
+        self._attach_datadog_headers(headers)
+        return headers
+
     def get_chatgpt_headers(self, referer: str = "https://chatgpt.com/login") -> dict:
         """
         获取 chatgpt.com 域名的请求头。
@@ -201,7 +234,7 @@ class BrowserSession:
             "referer": referer,
             "priority": "u=1, i",
         })
-        return headers
+        return self._attach_frontend_api_headers(headers)
 
     def get_auth_headers(self, referer: str = "https://auth.openai.com/create-account/password") -> dict:
         """
@@ -219,9 +252,9 @@ class BrowserSession:
             "priority": "u=1, i",
             "origin": "https://auth.openai.com",
         })
-        return headers
+        return self._attach_frontend_api_headers(headers)
 
-    def get_auth_navigate_headers(self, referer: str = "https://chatgpt.com/", user_initiated: bool = True) -> dict:
+    def get_auth_navigate_headers(self, referer: str = "https://chatgpt.com/", user_initiated: bool = True, target_origin: str = "https://auth.openai.com") -> dict:
         """
         获取 auth.openai.com 导航请求头（用于GET页面请求）。
         用于步骤4、5、8。
@@ -229,7 +262,7 @@ class BrowserSession:
         headers = self._get_common_headers()
         headers.update({
             "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-            "sec-fetch-site": self._sec_fetch_site_for("https://auth.openai.com", referer),
+            "sec-fetch-site": self._sec_fetch_site_for(target_origin, referer),
             "sec-fetch-mode": "navigate",
             "sec-fetch-dest": "document",
             "referer": referer,
@@ -238,7 +271,7 @@ class BrowserSession:
         })
         if user_initiated:
             headers["sec-fetch-user"] = "?1"
-        return headers
+        return self._attach_datadog_headers(headers)
 
     def get_chatgpt_navigate_headers(self, referer: str = "https://chatgpt.com/", user_initiated: bool = True) -> dict:
         """获取 chatgpt.com 页面导航请求头，用于预热登录页 / 回到应用页。"""
@@ -254,7 +287,7 @@ class BrowserSession:
         })
         if user_initiated:
             headers["sec-fetch-user"] = "?1"
-        return headers
+        return self._attach_datadog_headers(headers)
 
     def get_sentinel_headers(self) -> dict:
         """
@@ -273,7 +306,7 @@ class BrowserSession:
             "sec-fetch-dest": "empty",
             "priority": "u=1, i",
         })
-        return headers
+        return self._attach_frontend_api_headers(headers)
 
     def get(self, url: str, headers: dict = None, **kwargs):
         """发送 GET 请求"""

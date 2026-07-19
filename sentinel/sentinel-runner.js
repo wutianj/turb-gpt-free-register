@@ -89,6 +89,22 @@ function normalizeList(value, fallback) {
     .filter(Boolean);
 }
 
+function parseSecChBrands(value, major = "") {
+  const text = String(value || "").trim();
+  if (!text) {
+    return [
+      { brand: "Not)A;Brand", version: "8" },
+      { brand: "Chromium", version: String(major || "") },
+      { brand: "Google Chrome", version: String(major || "") },
+    ];
+  }
+  const out = [];
+  const re = /"([^"]+)"\s*;\s*v="([^"]+)"/g;
+  let m;
+  while ((m = re.exec(text))) out.push({ brand: m[1], version: m[2] });
+  return out.length ? out : text.split(",").map((part) => ({ brand: part.trim(), version: String(major || "") })).filter((x) => x.brand);
+}
+
 function xorDecode(text, key) {
   let output = "";
   const decoded = atobBinary(text);
@@ -298,6 +314,180 @@ function createDomRect(width = 0, height = 0) {
 }
 
 
+function createDomTokenList(initial = []) {
+  const tokens = new Set(initial);
+  const api = {
+    add(...items) { for (const item of items) if (item) tokens.add(String(item)); },
+    remove(...items) { for (const item of items) tokens.delete(String(item)); },
+    contains(item) { return tokens.has(String(item)); },
+    toggle(item, force) {
+      const token = String(item);
+      const shouldAdd = force === undefined ? !tokens.has(token) : Boolean(force);
+      if (shouldAdd) tokens.add(token); else tokens.delete(token);
+      return shouldAdd;
+    },
+    replace(oldToken, newToken) {
+      if (!tokens.has(String(oldToken))) return false;
+      tokens.delete(String(oldToken));
+      tokens.add(String(newToken));
+      return true;
+    },
+    item(index) { return [...tokens][Number(index)] || null; },
+    get length() { return tokens.size; },
+    toString() { return [...tokens].join(" "); },
+    [Symbol.iterator]() { return tokens[Symbol.iterator](); },
+  };
+  Object.defineProperty(api, Symbol.toStringTag, { value: "DOMTokenList" });
+  return api;
+}
+
+function createStyleDeclaration() {
+  const values = Object.create(null);
+  return {
+    get cssText() {
+      return Object.entries(values).map(([k, v]) => `${k}: ${v};`).join(" ");
+    },
+    set cssText(text) {
+      for (const part of String(text || "").split(";")) {
+        const idx = part.indexOf(":");
+        if (idx > 0) this.setProperty(part.slice(0, idx).trim(), part.slice(idx + 1).trim());
+      }
+    },
+    get length() { return Object.keys(values).length; },
+    item(index) { return Object.keys(values)[Number(index)] || ""; },
+    getPropertyValue(name) { return values[String(name)] || ""; },
+    setProperty(name, value) { values[String(name)] = String(value); this[String(name)] = String(value); },
+    removeProperty(name) { const key = String(name); const old = values[key] || ""; delete values[key]; delete this[key]; return old; },
+  };
+}
+
+function createElementNode(tagName, ownerDocument, rect = createDomRect()) {
+  const target = createEventTarget();
+  const children = [];
+  const attrs = new Map();
+  const dataset = {};
+  const element = {
+    nodeType: 1,
+    nodeName: String(tagName).toUpperCase(),
+    tagName: String(tagName).toUpperCase(),
+    ownerDocument,
+    parentNode: null,
+    parentElement: null,
+    children,
+    childNodes: children,
+    firstChild: null,
+    lastChild: null,
+    style: createStyleDeclaration(),
+    dataset,
+    classList: createDomTokenList(),
+    textContent: "",
+    innerHTML: "",
+    appendChild(node) {
+      children.push(node);
+      node.parentNode = element;
+      node.parentElement = element;
+      element.firstChild = children[0] || null;
+      element.lastChild = children[children.length - 1] || null;
+      return node;
+    },
+    removeChild(node) {
+      const index = children.indexOf(node);
+      if (index >= 0) children.splice(index, 1);
+      if (node) { node.parentNode = null; node.parentElement = null; }
+      element.firstChild = children[0] || null;
+      element.lastChild = children[children.length - 1] || null;
+      return node;
+    },
+    insertBefore(node, before) {
+      const index = children.indexOf(before);
+      if (index < 0) return this.appendChild(node);
+      children.splice(index, 0, node);
+      node.parentNode = element;
+      node.parentElement = element;
+      element.firstChild = children[0] || null;
+      element.lastChild = children[children.length - 1] || null;
+      return node;
+    },
+    remove() { if (element.parentNode?.removeChild) element.parentNode.removeChild(element); },
+    setAttribute(name, value) {
+      const key = String(name);
+      const val = String(value);
+      attrs.set(key, val);
+      if (key === "class") element.classList = createDomTokenList(val.split(/\s+/).filter(Boolean));
+      if (key === "id") element.id = val;
+      if (key.startsWith("data-")) {
+        const prop = key.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+        dataset[prop] = val;
+      }
+    },
+    getAttribute(name) { return attrs.get(String(name)) ?? null; },
+    hasAttribute(name) { return attrs.has(String(name)); },
+    removeAttribute(name) { attrs.delete(String(name)); },
+    getAttributeNames() { return [...attrs.keys()]; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    matches() { return false; },
+    closest() { return null; },
+    getBoundingClientRect() { return rect; },
+    addEventListener: target.addEventListener,
+    removeEventListener: target.removeEventListener,
+    dispatchEvent: target.dispatchEvent,
+    click() { target.dispatchEvent.call(element, { type: "click", target: element }); },
+  };
+  Object.defineProperty(element, "attributes", {
+    get() { return [...attrs].map(([name, value]) => ({ name, value, nodeName: name, nodeValue: value, valueOf: () => value })); },
+  });
+  return element;
+}
+
+function createPerformanceObserver() {
+  return class PerformanceObserverMock {
+    constructor(callback) { this.callback = callback; this._observed = false; }
+    observe() { this._observed = true; }
+    disconnect() { this._observed = false; }
+    takeRecords() { return []; }
+    static get supportedEntryTypes() { return ["navigation", "resource", "paint", "mark", "measure"]; }
+  };
+}
+
+function createNetworkInformation() {
+  const target = createEventTarget();
+  const info = {
+    downlink: 10,
+    effectiveType: "4g",
+    rtt: 50,
+    saveData: false,
+    type: "wifi",
+    onchange: null,
+    addEventListener: target.addEventListener,
+    removeEventListener: target.removeEventListener,
+    dispatchEvent: target.dispatchEvent,
+  };
+  Object.defineProperty(info, Symbol.toStringTag, { value: "NetworkInformation" });
+  return info;
+}
+
+function createCookieJar(initialCookie = "") {
+  const values = new Map();
+  for (const part of String(initialCookie || "").split(";")) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+    const idx = trimmed.indexOf("=");
+    if (idx <= 0) continue;
+    values.set(trimmed.slice(0, idx), trimmed.slice(idx + 1));
+  }
+  return {
+    get cookie() {
+      return [...values.entries()].map(([k, v]) => `${k}=${v}`).join("; ");
+    },
+    set cookie(value) {
+      const first = String(value || "").split(";")[0];
+      const idx = first.indexOf("=");
+      if (idx > 0) values.set(first.slice(0, idx).trim(), first.slice(idx + 1).trim());
+    },
+  };
+}
+
 function makeNativeFunction(name, impl = () => undefined) {
   const fn = function (...args) { return impl.apply(this, args); };
   Object.defineProperty(fn, "name", { value: name });
@@ -446,12 +636,33 @@ function createBrowserContext(options) {
   };
   browserCrypto.getRandomValues = crypto.webcrypto.getRandomValues.bind(crypto.webcrypto);
 
+  const perfEntries = [{
+    name: options.pageUrl,
+    entryType: "navigation",
+    startTime: 0,
+    duration: Math.max(1, performance.now()),
+    initiatorType: "navigation",
+    nextHopProtocol: options.nextHopProtocol || "h2",
+    transferSize: 0,
+    encodedBodySize: 0,
+    decodedBodySize: 0,
+    toJSON() { return { ...this }; },
+  }];
   const browserPerformance = {
     now: () => performance.now(),
     timeOrigin: performance.timeOrigin || Date.now() - performance.now(),
     memory: {
       jsHeapSizeLimit: options.jsHeapSizeLimit,
+      totalJSHeapSize: Math.floor(options.jsHeapSizeLimit / 3),
+      usedJSHeapSize: Math.floor(options.jsHeapSizeLimit / 8),
     },
+    getEntries() { return perfEntries.slice(); },
+    getEntriesByType(type) { return perfEntries.filter((entry) => entry.entryType === String(type)); },
+    getEntriesByName(name) { return perfEntries.filter((entry) => entry.name === String(name)); },
+    mark(name) { perfEntries.push({ name: String(name), entryType: "mark", startTime: this.now(), duration: 0, toJSON() { return { ...this }; } }); },
+    measure(name) { perfEntries.push({ name: String(name), entryType: "measure", startTime: this.now(), duration: 0, toJSON() { return { ...this }; } }); },
+    clearMarks() {},
+    clearMeasures() {},
   };
   const mathObject = Object.create(Math);
   if (Number.isFinite(options.fixedRandom)) {
@@ -468,16 +679,22 @@ function createBrowserContext(options) {
   const attrs = new Map([["data-build", options.buildId]]);
   const reactListeningKey = options.reactListeningKey || "_reactListening" + crypto.randomBytes(6).toString("hex");
 
+  const cookieJar = createCookieJar(options.cookie);
+  const location = new URL(options.pageUrl);
   let iframeNode = null;
   const bodyChildren = [];
+  const documentTarget = createEventTarget();
   const document = {
     currentScript,
     scripts,
-    cookie: options.cookie,
+    get cookie() { return cookieJar.cookie; },
+    set cookie(value) { cookieJar.cookie = value; },
     URL: options.pageUrl,
     documentURI: options.pageUrl,
-    referrer: "https://auth.openai.com/",
+    referrer: options.referrer || "https://auth.openai.com/",
     title: "",
+    origin: location.origin,
+    location,
     characterSet: "UTF-8",
     charset: "UTF-8",
     compatMode: "CSS1Compat",
@@ -487,8 +704,14 @@ function createBrowserContext(options) {
     hidden: false,
     hasFocus() { return true; },
     [reactListeningKey]: true,
+    defaultView: null,
+    head: null,
     documentElement: {
-      style: {},
+      nodeType: 1,
+      nodeName: "HTML",
+      tagName: "HTML",
+      ownerDocument: null,
+      style: createStyleDeclaration(),
       clientWidth: options.screen.width,
       clientHeight: options.screen.height,
       scrollWidth: options.screen.width,
@@ -499,12 +722,22 @@ function createBrowserContext(options) {
       setAttribute(name, value) {
         attrs.set(name, String(value));
       },
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
       getBoundingClientRect() {
         return createDomRect(options.screen.width, options.screen.height);
       },
     },
     body: {
-      style: {},
+      nodeType: 1,
+      nodeName: "BODY",
+      tagName: "BODY",
+      ownerDocument: null,
+      parentNode: null,
+      parentElement: null,
+      children: bodyChildren,
+      childNodes: bodyChildren,
+      style: createStyleDeclaration(),
       clientWidth: options.screen.width,
       clientHeight: options.screen.height,
       getBoundingClientRect() {
@@ -525,47 +758,45 @@ function createBrowserContext(options) {
         return node;
       },
     },
-    addEventListener() {},
-    removeEventListener() {},
-    querySelector() { return null; },
-    querySelectorAll() { return []; },
+    addEventListener: documentTarget.addEventListener,
+    removeEventListener: documentTarget.removeEventListener,
+    dispatchEvent: documentTarget.dispatchEvent,
+    querySelector(selector) {
+      const q = String(selector || "").toLowerCase();
+      if (q === "head") return this.head;
+      if (q === "body") return this.body;
+      if (q === "html" || q === "documentelement") return this.documentElement;
+      return null;
+    },
+    querySelectorAll(selector) { const item = this.querySelector(selector); return item ? [item] : []; },
     getElementById() { return null; },
-    getElementsByTagName(name) { return String(name).toLowerCase() === "script" ? scripts : []; },
+    getElementsByTagName(name) {
+      const n = String(name).toLowerCase();
+      if (n === "script") return scripts;
+      if (n === "head") return [this.head];
+      if (n === "body") return [this.body];
+      if (n === "html") return [this.documentElement];
+      return [];
+    },
+    createTextNode(text) { return { nodeType: 3, nodeName: "#text", textContent: String(text || ""), parentNode: null, ownerDocument: document }; },
     createElement(tagName) {
       const lowerTag = String(tagName).toLowerCase();
-      if (lowerTag === "canvas") return createCanvas(300, 150, isSafari);
+      if (lowerTag === "canvas") {
+        const canvas = createCanvas(300, 150, isSafari);
+        canvas.ownerDocument = document;
+        return canvas;
+      }
       if (lowerTag !== "iframe") {
-        const children = [];
-        const element = {
-          tagName: String(tagName).toUpperCase(),
-          style: {},
-          parentNode: null,
-          children,
-          appendChild(node) {
-            children.push(node);
-            node.parentNode = element;
-            return node;
-          },
-          removeChild(node) {
-            const index = children.indexOf(node);
-            if (index >= 0) children.splice(index, 1);
-            if (node) node.parentNode = null;
-            return node;
-          },
-          addEventListener() {},
-          removeEventListener() {},
-          getBoundingClientRect() {
-            return createDomRect();
-          },
-        };
-        return element;
+        return createElementNode(tagName, document);
       }
 
       const target = createEventTarget();
-      const iframe = {
-        tagName: "IFRAME",
-        style: {},
+      const iframe = createElementNode("iframe", document);
+      Object.assign(iframe, {
         src: "",
+        width: "",
+        height: "",
+        sandbox: { value: "", toString() { return this.value; } },
         getBoundingClientRect() {
           return createDomRect();
         },
@@ -601,15 +832,20 @@ function createBrowserContext(options) {
         },
         addEventListener: target.addEventListener,
         removeEventListener: target.removeEventListener,
+        dispatchEvent: target.dispatchEvent,
         _emitLoad() {
           target.dispatchEvent.call(iframe, { type: "load", target: iframe });
         },
-      };
+      });
       return iframe;
     },
   };
 
-  const location = new URL(options.pageUrl);
+  document.defaultView = null;
+  document.documentElement.ownerDocument = document;
+  document.body.ownerDocument = document;
+  document.head = createElementNode("head", document);
+
   const browserFamily = String(options.browserFamily || "chrome").toLowerCase();
   const isSafari = browserFamily === "safari" || /Version\/[^ ]+ Safari\//.test(String(options.userAgent || ""));
   const exposeRequestIdleCallback = !isSafari && options.requestIdleCallback !== false;
@@ -645,7 +881,7 @@ function createBrowserContext(options) {
     vendor: isSafari ? "Apple Computer, Inc." : "Google Inc.",
     webdriver: false,
     bluetooth: { toString: () => "[object Bluetooth]" },
-    connection: { downlink: 10, effectiveType: "4g", rtt: 50, saveData: false },
+    connection: createNetworkInformation(),
     permissions: { query: async () => ({ state: "prompt", onchange: null }) },
     geolocation: {
       getCurrentPosition(success, error) { if (typeof error === "function") error({ code: 1, message: "User denied Geolocation" }); },
@@ -660,26 +896,25 @@ function createBrowserContext(options) {
     ...(isSafari ? {} : {
       userAgentData: {
         mobile: false,
-        platform: "macOS",
-        brands: [
-          { brand: "Not)A;Brand", version: "8" },
-          { brand: "Chromium", version: String(options.chromeMajor || "") },
-          { brand: "Google Chrome", version: String(options.chromeMajor || "") },
-        ],
-        getHighEntropyValues: async () => ({
-          architecture: "arm",
-          bitness: "64",
-          mobile: false,
-          model: "",
-          platform: "macOS",
-          platformVersion: "15.5.0",
-          uaFullVersion: options.chromeFullVersion || "",
-          fullVersionList: [
-            { brand: "Not)A;Brand", version: "8.0.0.0" },
-            { brand: "Chromium", version: options.chromeFullVersion || "" },
-            { brand: "Google Chrome", version: options.chromeFullVersion || "" },
-          ],
-        }),
+        platform: options.secChUaPlatform || "macOS",
+        brands: parseSecChBrands(options.secChUa, options.chromeMajor),
+        getHighEntropyValues: async (hints = []) => {
+          const values = {
+            architecture: options.secChUaArch || "arm",
+            bitness: options.secChUaBitness || "64",
+            mobile: false,
+            model: options.secChUaModel || "",
+            platform: options.secChUaPlatform || "macOS",
+            platformVersion: options.secChUaPlatformVersion || "15.5.0",
+            uaFullVersion: options.chromeFullVersion || "",
+            fullVersionList: parseSecChBrands(options.secChUaFullVersionList, options.chromeFullVersion || options.chromeMajor),
+          };
+          if (!Array.isArray(hints) || hints.length === 0) return values;
+          const picked = {};
+          for (const hint of hints) if (hint in values) picked[hint] = values[hint];
+          return picked;
+        },
+        toJSON() { return { brands: this.brands, mobile: this.mobile, platform: this.platform }; },
       },
     }),
   });
@@ -714,6 +949,15 @@ function createBrowserContext(options) {
     scrollTo() {},
     scrollBy() {},
     matchMedia(query) { return { matches: false, media: String(query), onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false; } }; },
+    getComputedStyle(element) { return element?.style || createStyleDeclaration(); },
+    MessageEvent: class MessageEvent { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
+    Event: class Event { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
+    CustomEvent: class CustomEvent { constructor(type, init = {}) { this.type = type; this.detail = init.detail; Object.assign(this, init); } },
+    DOMRect: class DOMRect { constructor(x = 0, y = 0, width = 0, height = 0) { Object.assign(this, { x, y, width, height, top: y, left: x, right: x + width, bottom: y + height }); } },
+    HTMLElement: function HTMLElement() {},
+    HTMLIFrameElement: function HTMLIFrameElement() {},
+    MutationObserver: class MutationObserver { constructor(callback) { this.callback = callback; } observe() {} disconnect() {} takeRecords() { return []; } },
+    PerformanceObserver: createPerformanceObserver(),
     document,
     navigator,
     screen: options.screen,
@@ -736,6 +980,8 @@ function createBrowserContext(options) {
     AbortController,
     setTimeout: managedSetTimeout,
     clearTimeout: managedClearTimeout,
+    setInterval: managedSetTimeout,
+    clearInterval: managedClearTimeout,
     btoa: btoaBinary,
     atob: atobBinary,
     fetch,
@@ -792,6 +1038,7 @@ function createBrowserContext(options) {
   window.top = window;
   window.parent = window;
   window.frames = window;
+  document.defaultView = window;
 
   return {
     iframeNode: () => iframeNode,
@@ -813,8 +1060,18 @@ function createBrowserContext(options) {
       URL,
       URLSearchParams,
       AbortController,
+      MessageEvent: window.MessageEvent,
+      Event: window.Event,
+      CustomEvent: window.CustomEvent,
+      DOMRect: window.DOMRect,
+      HTMLElement: window.HTMLElement,
+      HTMLIFrameElement: window.HTMLIFrameElement,
+      MutationObserver: window.MutationObserver,
+      PerformanceObserver: window.PerformanceObserver,
       setTimeout: managedSetTimeout,
       clearTimeout: managedClearTimeout,
+      setInterval: managedSetTimeout,
+      clearInterval: managedClearTimeout,
       btoa: btoaBinary,
       atob: atobBinary,
       fetch,
@@ -953,6 +1210,13 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
     devicePixelRatio: Number(pick(args["device-pixel-ratio"], cfg("devicePixelRatio", "device_pixel_ratio"), process.env.SENTINEL_DEVICE_PIXEL_RATIO, 2)),
     chromeMajor: pick(args["chrome-major"], cfg("chromeMajor", "chrome_major"), process.env.SENTINEL_CHROME_MAJOR, ""),
     chromeFullVersion: pick(args["chrome-full-version"], cfg("chromeFullVersion", "chrome_full_version"), process.env.SENTINEL_CHROME_FULL_VERSION, ""),
+    secChUa: pick(args["sec-ch-ua"], cfg("secChUa", "sec_ch_ua"), process.env.SENTINEL_SEC_CH_UA, ""),
+    secChUaPlatform: String(pick(args["sec-ch-ua-platform"], cfg("secChUaPlatform", "sec_ch_ua_platform"), process.env.SENTINEL_SEC_CH_UA_PLATFORM, "macOS")).replace(/^"|"$/g, ""),
+    secChUaFullVersionList: pick(args["sec-ch-ua-full-version-list"], cfg("secChUaFullVersionList", "sec_ch_ua_full_version_list"), process.env.SENTINEL_SEC_CH_UA_FULL_VERSION_LIST, ""),
+    secChUaPlatformVersion: String(pick(args["sec-ch-ua-platform-version"], cfg("secChUaPlatformVersion", "sec_ch_ua_platform_version"), process.env.SENTINEL_SEC_CH_UA_PLATFORM_VERSION, "15.5.0")).replace(/^"|"$/g, ""),
+    secChUaArch: String(pick(args["sec-ch-ua-arch"], cfg("secChUaArch", "sec_ch_ua_arch"), process.env.SENTINEL_SEC_CH_UA_ARCH, "arm")).replace(/^"|"$/g, ""),
+    secChUaBitness: String(pick(args["sec-ch-ua-bitness"], cfg("secChUaBitness", "sec_ch_ua_bitness"), process.env.SENTINEL_SEC_CH_UA_BITNESS, "64")).replace(/^"|"$/g, ""),
+    secChUaModel: String(pick(args["sec-ch-ua-model"], cfg("secChUaModel", "sec_ch_ua_model"), process.env.SENTINEL_SEC_CH_UA_MODEL, "")).replace(/^"|"$/g, ""),
     screen: (() => {
       const width = Number(pick(args.width, cfg("width", "screenWidth"), process.env.SENTINEL_SCREEN_WIDTH, 1728));
       const height = Number(pick(args.height, cfg("height", "screenHeight"), process.env.SENTINEL_SCREEN_HEIGHT, 1117));

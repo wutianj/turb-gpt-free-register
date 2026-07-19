@@ -142,7 +142,51 @@ def _is_transient_network_error(exc: Exception) -> bool:
     return any(k in msg for k in transient_keywords)
 
 
-def follow_authorize(session: BrowserSession, authorize_url: str) -> None:
+def network_preflight(session: BrowserSession) -> None:
+    """
+    注册前网络预检：只建立边缘节点/cookie/基础连通性，不携带邮箱、不触发 OTP。
+
+    这样真正会“烧邮箱”的 authorize 重定向发生前，已经确认当前代理、TLS
+    impersonate、ChatGPT/Auth/Sentinel 三段链路都可达。
+    """
+    checks = [
+        ("chatgpt-login", lambda: session.get(
+            "https://chatgpt.com/login",
+            headers=session.get_chatgpt_navigate_headers(referer="https://chatgpt.com/"),
+            allow_redirects=True,
+        )),
+        ("auth-login", lambda: session.get(
+            "https://auth.openai.com/log-in",
+            headers=session.get_auth_navigate_headers(referer="https://chatgpt.com/login"),
+            allow_redirects=True,
+        )),
+        ("sentinel-frame", lambda: session.get(
+            "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=" + __import__("config", fromlist=["SENTINEL_SV"]).SENTINEL_SV,
+            headers=session.get_auth_navigate_headers(referer="https://auth.openai.com/log-in", target_origin="https://sentinel.openai.com"),
+            allow_redirects=True,
+        )),
+    ]
+    for label, fn in checks:
+        last_exc = None
+        for attempt in range(1, _FOLLOW_AUTH_MAX_ATTEMPTS + 1):
+            try:
+                logger.info(f"[预检] {label} ({attempt}/{_FOLLOW_AUTH_MAX_ATTEMPTS})")
+                resp = fn()
+                if getattr(resp, "status_code", 0) >= 400:
+                    raise RuntimeError(f"{label} status={resp.status_code}, body={(getattr(resp, 'text', '') or '')[:180]}")
+                break
+            except Exception as exc:
+                last_exc = exc
+                if not _is_transient_network_error(exc) or attempt >= _FOLLOW_AUTH_MAX_ATTEMPTS:
+                    raise
+                backoff = _FOLLOW_AUTH_BACKOFF_BASE ** (attempt - 1)
+                logger.warning(f"[预检] {label} 临时失败：{type(exc).__name__}: {str(exc)[:120]}，{backoff:.1f}s 后重试")
+                time.sleep(backoff)
+        else:
+            raise last_exc if last_exc else RuntimeError(f"[预检] {label} 未完成")
+
+
+def follow_authorize(session: BrowserSession, authorize_url: str) -> str:
     """
     步骤4: 跟随 authorize URL 重定向。
     GET auth.openai.com/api/accounts/authorize?...
@@ -162,8 +206,11 @@ def follow_authorize(session: BrowserSession, authorize_url: str) -> None:
             logger.info(f"[步骤4] 跟随 authorize URL 重定向 (尝试 {attempt}/{_FOLLOW_AUTH_MAX_ATTEMPTS})...")
             resp = session.get(authorize_url, headers=headers, allow_redirects=True)
             resp.raise_for_status()
-            logger.info(f"[步骤4] 重定向完成, 最终URL: {resp.url}")
-            return
+            final_url = str(getattr(resp, "url", "") or "")
+            if "/api/accounts/user/register" in final_url or "/create-account/password" in final_url:
+                raise RuntimeError(f"[步骤4] 落入旧密码注册路径，已拒绝继续烧邮箱: {final_url}")
+            logger.info(f"[步骤4] 重定向完成, 最终URL: {final_url}")
+            return final_url
         except Exception as exc:
             last_exc = exc
             if not _is_transient_network_error(exc):
@@ -357,6 +404,24 @@ def build_sentinel_header(session: BrowserSession, sentinel_resp: dict, flow: st
 #     logger.info(f"[步骤8] 验证码发送请求完成, 状态码: {resp.status_code}")
 
 
+def navigate_about_you(session: BrowserSession, about_url: str | None = None) -> str:
+    """进入 about-you 页面状态；服务端未返回 continue_url 时使用默认页面 URL 兜底。"""
+    url = str(about_url or "https://auth.openai.com/about-you")
+    if url.startswith("/"):
+        url = "https://auth.openai.com" + url
+    headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification")
+    headers["sec-fetch-site"] = "same-origin"
+    logger.info("[步骤10.5] 导航到 about-you 页面，建立资料页状态")
+    resp = session.get(url, headers=headers, allow_redirects=True)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"about-you 导航失败 status={resp.status_code}: {(resp.text or '')[:240]}")
+    final_url = str(getattr(resp, "url", "") or url)
+    if "/api/accounts/user/register" in final_url or "/create-account/password" in final_url:
+        raise RuntimeError(f"about-you 导航落入旧密码注册路径: {final_url}")
+    logger.info(f"[步骤10.5] about-you 导航完成，落点: {final_url}")
+    return final_url
+
+
 def send_email_otp(session: BrowserSession, referer: str = "https://auth.openai.com/email-verification") -> None:
     """重新发送邮箱验证码。用于验证码错误/过期后重新取码。"""
     url = "https://auth.openai.com/api/accounts/email-otp/send"
@@ -371,7 +436,7 @@ def send_email_otp(session: BrowserSession, referer: str = "https://auth.openai.
     logger.info("[OTP] 重新发送验证码请求完成，status=%s", resp.status_code)
 
 
-def validate_email_otp(session: BrowserSession, code: str, sentinel_header: str | None = None) -> dict:
+def validate_email_otp(session: BrowserSession, code: str, sentinel_header: str | None = None, so_header: str | None = None) -> dict:
     """
     步骤10: 提交邮箱验证码验证。
     POST https://auth.openai.com/api/accounts/email-otp/validate
@@ -394,6 +459,9 @@ def validate_email_otp(session: BrowserSession, code: str, sentinel_header: str 
     headers = session.get_auth_headers(referer="https://auth.openai.com/email-verification")
     if sentinel_header:
         headers["openai-sentinel-token"] = sentinel_header
+    if so_header:
+        headers["openai-sentinel-so-token"] = so_header
+        logger.info("[步骤10] 已添加 openai-sentinel-so-token 头")
 
     body = json.dumps({"code": code})
 
