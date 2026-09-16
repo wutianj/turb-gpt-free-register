@@ -4,8 +4,17 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import random
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
 import time
+import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
@@ -13,6 +22,15 @@ import requests
 from config import roxybrowser as _cfg
 
 logger = logging.getLogger(__name__)
+
+
+_LOCAL_API_START_LOCK = threading.Lock()
+_PROFILE_CREATE_LOCK = threading.Lock()
+_COUNTRY_CODE_RE = re.compile(r"^[A-Za-z]{2}$")
+_PROXY_COUNTRY_MARKER_RE = re.compile(
+    r"(?:^|[-_.])(?:region|country)[-_.]?([A-Za-z]{2})(?=$|[-_.])",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -23,6 +41,42 @@ class RoxyOpenResult:
     webdriver_url: str | None = None
     ws_endpoint: str | None = None
     created_by_run: bool = False
+    static_cache_dir: str | None = None
+
+
+_STATIC_CACHE_LOCK = threading.Lock()
+
+
+def _is_profile_create_busy_error(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    return any(marker in text for marker in ("正在创建", "创建中", "already creating", "creation in progress"))
+
+
+def _prepare_static_cache_dir() -> Path | None:
+    if not bool(getattr(_cfg, "ROXY_STATIC_CACHE_ENABLED", False)):
+        return None
+    template = Path(str(getattr(_cfg, "ROXY_STATIC_CACHE_TEMPLATE_DIR", "data/roxy-static-cache-template"))).resolve()
+    target = (Path(tempfile.gettempdir()).resolve() / f"roxy-static-cache-{uuid.uuid4().hex}").resolve()
+    target.mkdir(parents=True)
+    with _STATIC_CACHE_LOCK:
+        if template.is_dir():
+            shutil.copytree(template, target, dirs_exist_ok=True)
+    return target
+
+
+def _cleanup_static_cache_dir(path_value: str | None) -> None:
+    if not path_value:
+        return
+    path = Path(path_value).resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    if temp_root not in path.parents or not path.name.startswith("roxy-static-cache-"):
+        return
+    template = Path(str(getattr(_cfg, "ROXY_STATIC_CACHE_TEMPLATE_DIR", "data/roxy-static-cache-template"))).resolve()
+    with _STATIC_CACHE_LOCK:
+        if path.is_dir() and not template.exists():
+            template.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(path, template)
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def _strip_slashes(value: str) -> str:
@@ -34,12 +88,57 @@ def _join_url(base: str, path: str) -> str:
 
 
 def _mask_proxy(proxy_url: str) -> str:
-    parsed = urlparse(str(proxy_url or "").strip())
+    text = str(proxy_url or "").strip().lstrip("\"'").rstrip("\"'").strip()
+    parsed = urlparse(text)
     if parsed.username or parsed.password:
         host = parsed.hostname or ""
         port = f":{parsed.port}" if parsed.port else ""
         return f"{parsed.scheme}://***:***@{host}{port}"
-    return str(proxy_url or "").strip()
+    # Proxy suppliers commonly use host:port:user:password.  Do not emit
+    # credentials to the task log if this format is rejected or malformed.
+    parts = text.split(":", 3)
+    if len(parts) == 4 and parts[1].isdigit():
+        return f"http://***:***@{parts[0]}:{parts[1]}"
+    return text
+
+
+def extract_proxy_country_code(proxy: str | dict | None) -> str:
+    """Return a two-letter country code without retaining proxy credentials."""
+
+    if isinstance(proxy, dict):
+        for key in ("proxyCountryCode", "countryCode", "country_code", "country", "region"):
+            direct = str(proxy.get(key) or "").strip()
+            if _COUNTRY_CODE_RE.fullmatch(direct):
+                return direct.upper()
+        for key in ("proxyUserName", "proxyUsername", "proxyUser", "username", "user"):
+            code = extract_proxy_country_code(str(proxy.get(key) or ""))
+            if code:
+                return code
+        return ""
+
+    text = str(proxy or "").strip().lstrip("\"'").rstrip("\"'").strip()
+    if not text:
+        return ""
+    if _COUNTRY_CODE_RE.fullmatch(text):
+        return text.upper()
+
+    candidate = text
+    if "://" in text:
+        parsed = urlparse(text)
+        candidate = unquote(parsed.username or "")
+    else:
+        parts = text.split(":", 3)
+        if len(parts) == 4 and parts[1].isdigit():
+            candidate = unquote(parts[2])
+        else:
+            provider_code = re.fullmatch(r"[A-Za-z][A-Za-z0-9_.+-]*:([A-Za-z]{2})", text)
+            if provider_code:
+                return provider_code.group(1).upper()
+
+    if _COUNTRY_CODE_RE.fullmatch(candidate):
+        return candidate.upper()
+    marker = _PROXY_COUNTRY_MARKER_RE.search(candidate)
+    return marker.group(1).upper() if marker else ""
 
 
 def _proxy_url_to_roxy_info(proxy_url: str) -> dict:
@@ -51,11 +150,27 @@ def _proxy_url_to_roxy_info(proxy_url: str) -> dict:
       https://user:pass@host:port
       socks5://user:pass@host:port
       socks5h://user:pass@host:port  -> Roxy 侧按 SOCKS5 处理
+      host:port:user:password         -> 由 ROXY_PROXY_DEFAULT_PROTOCOL 决定
     """
-    text = str(proxy_url or "").strip()
+    text = str(proxy_url or "").strip().lstrip("\"'").rstrip("\"'").strip()
     if not text:
         raise ValueError("代理为空")
+    has_explicit_scheme = "://" in text
     parsed = urlparse(text)
+    if not has_explicit_scheme:
+        parts = text.split(":", 3)
+        if len(parts) not in (2, 4) or not parts[0] or not parts[1].isdigit():
+            raise ValueError(f"代理格式无效: {_mask_proxy(text)}")
+        host, port = parts[0], parts[1]
+        username = parts[2] if len(parts) == 4 else ""
+        password = parts[3] if len(parts) == 4 else ""
+        default_scheme = str(getattr(_cfg, "ROXY_PROXY_DEFAULT_PROTOCOL", "http") or "http").strip().lower()
+        if default_scheme not in ("http", "https", "socks5", "socks5h"):
+            raise ValueError(f"ROXY_PROXY_DEFAULT_PROTOCOL 无效: {default_scheme}")
+        parsed = urlparse(f"{default_scheme}://{host}:{port}")
+    else:
+        username = unquote(parsed.username) if parsed.username else ""
+        password = unquote(parsed.password) if parsed.password else ""
     scheme = (parsed.scheme or "").lower()
     if scheme not in ("http", "https", "socks5", "socks5h"):
         raise ValueError(f"Roxy 暂不支持该代理协议: {scheme or '-'}")
@@ -80,10 +195,10 @@ def _proxy_url_to_roxy_info(proxy_url: str) -> dict:
         "host": parsed.hostname,
         "port": str(parsed.port),
     }
-    if parsed.username:
-        info["proxyUserName"] = unquote(parsed.username)
-    if parsed.password:
-        info["proxyPassword"] = unquote(parsed.password)
+    if username:
+        info["proxyUserName"] = username
+    if password:
+        info["proxyPassword"] = password
     check_channel = str(getattr(_cfg, "ROXY_PROXY_CHECK_CHANNEL", "") or "").strip()
     if check_channel:
         info["checkChannel"] = check_channel
@@ -121,11 +236,186 @@ def _project_id_value() -> str | int:
     return int(raw) if raw.isdigit() else raw
 
 
+def _apply_data_saver_open_args(params: dict) -> dict:
+    """在 Roxy 启动参数中尽早关闭图片加载，覆盖无扩展名图片 URL。
+
+    Network.setBlockedURLs 只能按 URL 后缀拦截，而 Roxy 浏览器在 Selenium 连接
+    前就已经启动；使用 Chromium 开关可以让图片在首个页面请求前就被禁用。该开关
+    只在用户明确开启省流量模式且包含 image 类型时追加。
+    """
+    try:
+        from config import browser as _browser_cfg
+
+        if not bool(getattr(_browser_cfg, "BROWSER_DATA_SAVER_MODE", False)):
+            return params
+        raw_types = getattr(_browser_cfg, "BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES", [])
+        if isinstance(raw_types, str):
+            types = {item.strip().lower() for item in raw_types.replace(",", "\n").splitlines() if item.strip()}
+        else:
+            types = {str(item or "").strip().lower() for item in (raw_types or []) if str(item or "").strip()}
+        if "image" not in types and "images" not in types and "img" not in types:
+            return params
+
+        current = params.get("args")
+        if isinstance(current, (list, tuple)):
+            args = list(current)
+        elif current:
+            args = [str(current)]
+        else:
+            args = []
+        switch = "--blink-settings=imagesEnabled=false"
+        if switch not in args:
+            args.append(switch)
+        params["args"] = args
+    except Exception as exc:
+        logger.debug("[Roxy] 添加省流量图片启动参数失败，继续使用原参数：%s", exc)
+    return params
+
+
+def _random_roxy_os() -> str:
+    raw = str(getattr(_cfg, "ROXY_RANDOM_OS_CHOICES", "Windows,macOS") or "Windows,macOS")
+    choices = [
+        x.strip()
+        for part in raw.replace("\n", ",").replace(";", ",").split(",")
+        for x in [part]
+        if x.strip()
+    ]
+    valid = {"Windows", "macOS", "Linux", "IOS", "Android"}
+    choices = [x for x in choices if x in valid]
+    if not choices:
+        choices = ["Windows", "macOS"]
+    return random.choice(choices)
+
+
+def _random_roxy_locale() -> str:
+    """从 ROXY_LOCALE_CHOICES 随机取一个 BCP-47 locale。
+
+    仅对本地无限窗口 API（roxy-api.mjs）生效：该 API 会把 locale 展开为
+    appLocale / acceptLang / timeZone 三个互相一致的字段，写进每个档案的
+    lumi.conf。官方 API 不认识 locale 字段，会直接忽略，不影响兼容性。
+    """
+    raw = str(getattr(_cfg, "ROXY_LOCALE_CHOICES", "") or "").strip()
+    choices = [
+        x.strip()
+        for part in raw.replace("\n", ",").replace(";", ",").split(",")
+        for x in [part]
+        if x.strip()
+    ]
+    if not choices:
+        return ""
+    return random.choice(choices)
+
+
+def _random_roxy_profile_name() -> str:
+    prefix = str(getattr(_cfg, "ROXY_PROFILE_NAME_PREFIX", "rb") or "rb").strip() or "rb"
+    # Roxy 环境名每次创建都不同：前缀 + 毫秒时间戳 + 随机 4 位十六进制。
+    return f"{prefix}-{int(time.time() * 1000)}-{random.randrange(0x10000):04x}"
+
+
+def _local_api_port(api_base: str) -> int | None:
+    """Return the port for a loopback API base; remote/custom hosts are excluded."""
+    try:
+        parsed = urlparse(str(api_base or "").strip())
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            return None
+        return int(parsed.port or (443 if parsed.scheme == "https" else 80))
+    except (TypeError, ValueError):
+        return None
+
+
+def _is_connection_refused(exc: Exception) -> bool:
+    """Only classify transport-level refusal as safe for API process recovery."""
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    text = str(exc or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "failed to establish a new connection",
+            "connection refused",
+            "max retries exceeded",
+            "winerror 10061",
+        )
+    )
+
+
+def _start_local_api(api_base: str) -> bool:
+    """Start the bundled local API once and wait for its health endpoint."""
+    port = _local_api_port(api_base)
+    if port is None or os.name != "nt":
+        return False
+
+    script = Path(__file__).resolve().parents[1] / "tools" / "roxy-unlimited-windows" / "svc.ps1"
+    if not script.is_file():
+        logger.warning("[Roxy] 本地 API 已拒绝连接，但未找到自动启动脚本：%s", script)
+        return False
+
+    with _LOCAL_API_START_LOCK:
+        health_url = _join_url(api_base, "/health")
+        try:
+            health = requests.get(health_url, timeout=2)
+            if health.ok:
+                return True
+        except requests.RequestException:
+            pass
+
+        command = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            "-Action",
+            "start",
+            "-Port",
+            str(port),
+        ]
+        try:
+            # svc.ps1 starts a detached Node process and writes its own logs.  Do
+            # not capture its stdio: on Windows the child can retain those pipe
+            # handles after the PowerShell wrapper has done its work, leaving
+            # subprocess.run waiting forever even though the API is healthy.
+            process = subprocess.Popen(
+                command,
+                cwd=str(script.parent),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as exc:
+            logger.warning("[Roxy] 自动启动本地 API 异常：%s: %s", type(exc).__name__, exc)
+            return False
+
+        deadline = time.monotonic() + 35
+        while time.monotonic() < deadline:
+            try:
+                health = requests.get(health_url, timeout=2)
+                if health.ok:
+                    logger.warning("[Roxy] 已自动启动本地 API：port=%s pid=%s", port, process.pid)
+                    return True
+            except requests.RequestException:
+                pass
+            if process.poll() is not None:
+                logger.warning("[Roxy] 自动启动本地 API 失败：exit=%s", process.returncode)
+                return False
+            time.sleep(0.5)
+
+        logger.warning("[Roxy] 自动启动本地 API 超时：port=%s pid=%s", port, process.pid)
+        try:
+            process.terminate()
+        except Exception:
+            pass
+        return False
+
+
 class RoxyBrowserClient:
     def __init__(self, api_base: str | None = None, token: str | None = None):
         self.api_base = (api_base or _cfg.ROXY_API_BASE).strip()
         self.token = (token if token is not None else _cfg.ROXY_API_TOKEN).strip()
         self.http = requests.Session()
+        self.last_create_metadata: dict = {}
         if self.token:
             # 官方文档要求所有接口请求头必须加 token。这里同时兼容 token / Authorization。
             self.http.headers.update({
@@ -157,8 +447,11 @@ class RoxyBrowserClient:
         is_create = str(path or "").rstrip("/").endswith("/create") or "browser/create" in str(path or "")
         max_attempts = 1 if is_create else max(1, int(getattr(_cfg, "ROXY_API_RETRIES", 3) or 3))
         base_delay = max(0.5, float(getattr(_cfg, "ROXY_API_RETRY_DELAY", 2) or 2))
+        api_bootstrap_attempts = 1 if _local_api_port(self.api_base) is not None else 0
         last_exc: Exception | None = None
-        for attempt in range(1, max_attempts + 1):
+        attempt = 0
+        while attempt < max_attempts:
+            attempt += 1
             try:
                 logger.debug(
                     "[Roxy] %s %s params=%s body=%s attempt=%s/%s",
@@ -190,6 +483,14 @@ class RoxyBrowserClient:
                 return payload if isinstance(payload, dict) else {"data": payload}
             except Exception as exc:
                 last_exc = exc
+                if api_bootstrap_attempts and _is_connection_refused(exc):
+                    api_bootstrap_attempts = 0
+                    if _start_local_api(self.api_base):
+                        # A refused TCP connection cannot have reached the API, so one
+                        # retry is safe even for /browser/create (which is otherwise
+                        # intentionally single-attempt to avoid duplicate profiles).
+                        max_attempts = max(max_attempts, attempt + 1)
+                        continue
                 retryable = self._is_retryable_error(exc)
                 if attempt >= max_attempts or not retryable:
                     raise
@@ -354,13 +655,32 @@ class RoxyBrowserClient:
 
     def create_profile(self, payload: dict | None = None) -> str:
         body = dict(getattr(_cfg, "ROXY_PROFILE_CREATE_PAYLOAD", {}) or {})
-        default_os = str(getattr(_cfg, "ROXY_DEFAULT_OS", "macOS") or "macOS").strip()
-        if default_os:
-            # Roxy 官方枚举为 macOS（大小写敏感），默认创建 macOS 指纹环境。
-            body.setdefault("os", default_os)
-        default_os_version = str(getattr(_cfg, "ROXY_DEFAULT_OS_VERSION", "") or "").strip()
-        if default_os_version:
-            body.setdefault("osVersion", default_os_version)
+        random_name_enabled = bool(getattr(_cfg, "ROXY_RANDOM_PROFILE_NAME_ON_CREATE", True))
+        if random_name_enabled:
+            # 覆盖 ROXY_PROFILE_CREATE_PAYLOAD 里的固定 name，避免所有 Roxy 窗口同名。
+            body["name"] = _random_roxy_profile_name()
+        random_os_enabled = bool(getattr(_cfg, "ROXY_RANDOM_OS_ON_CREATE", True))
+        if random_os_enabled:
+            # 每次创建环境随机 Windows / macOS；覆盖 ROXY_PROFILE_CREATE_PAYLOAD 里的固定 os。
+            body["os"] = _random_roxy_os()
+            # osVersion 跟 os 强绑定，随机 OS 时不沿用固定版本，避免 macOS 版本传给 Windows。
+            body.pop("osVersion", None)
+        else:
+            default_os = str(getattr(_cfg, "ROXY_DEFAULT_OS", "macOS") or "macOS").strip()
+            if default_os:
+                # Roxy 官方枚举大小写敏感：Windows / macOS / Linux / IOS / Android。
+                body.setdefault("os", default_os)
+            default_os_version = str(getattr(_cfg, "ROXY_DEFAULT_OS_VERSION", "") or "").strip()
+            if default_os_version:
+                body.setdefault("osVersion", default_os_version)
+        # 每次创建环境随机语言/时区。本地无限 API 会把 locale 展开成
+        # appLocale/acceptLang/timeZone 一并写入指纹，避免所有窗口共用模板的
+        # 同一套语言和时区。官方 API 忽略该字段。
+        locale_random_enabled = bool(getattr(_cfg, "ROXY_RANDOM_LOCALE_ON_CREATE", True))
+        if locale_random_enabled and not body.get("locale"):
+            locale_value = _random_roxy_locale()
+            if locale_value:
+                body["locale"] = locale_value
         workspace_id = _workspace_id_value()
         if workspace_id:
             # Roxy 官方 /browser/create 要求 workspaceId。
@@ -391,8 +711,32 @@ class RoxyBrowserClient:
                 "Roxy 创建环境需要 workspaceId。请在 config/roxybrowser.py 或 WebUI 的 RoxyBrowser 配置中填写 ROXY_WORKSPACE_ID，"
                 "或直接在 ROXY_PROFILE_CREATE_PAYLOAD 里加入 {'workspaceId': '你的工作区ID'}。"
             )
-        logger.info("[Roxy] 创建环境参数：workspaceId=%s projectId=%s os=%s osVersion=%s", body.get("workspaceId"), body.get("projectId") or "-", body.get("os") or "-", body.get("osVersion") or "-")
-        result = self.request(_cfg.ROXY_CREATE_METHOD, _cfg.ROXY_CREATE_PATH, json_body=body)
+        logger.info(
+            "[Roxy] 创建环境参数：workspaceId=%s projectId=%s name=%s random_name=%s os=%s osVersion=%s random_os=%s locale=%s random_locale=%s",
+            body.get("workspaceId"),
+            body.get("projectId") or "-",
+            body.get("name") or "-",
+            random_name_enabled,
+            body.get("os") or "-",
+            body.get("osVersion") or "-",
+            random_os_enabled,
+            body.get("locale") or "-",
+            locale_random_enabled,
+        )
+        with _PROFILE_CREATE_LOCK:
+            result = None
+            for attempt in range(1, 6):
+                try:
+                    result = self.request(_cfg.ROXY_CREATE_METHOD, _cfg.ROXY_CREATE_PATH, json_body=body)
+                    break
+                except Exception as exc:
+                    if not _is_profile_create_busy_error(exc) or attempt >= 5:
+                        raise
+                    delay = min(5.0, 1.0 + attempt)
+                    logger.warning("[Roxy] 环境创建接口忙，第 %s/5 次尝试，%.1f 秒后重试", attempt, delay)
+                    time.sleep(delay)
+            if result is None:
+                raise RuntimeError("Roxy 创建环境未返回结果")
         profile_id = _first(result, [
             ("id",), ("dirId",), ("dir_id",), ("profile_id",), ("profileId",), ("browser_id",),
             ("data", "id"), ("data", "dirId"), ("data", "dir_id"),
@@ -400,6 +744,21 @@ class RoxyBrowserClient:
         ])
         if not profile_id:
             raise RuntimeError(f"Roxy 创建环境成功但未返回 dirId/profile_id: {result}")
+        proxy_info = body.get("proxyInfo") if isinstance(body.get("proxyInfo"), dict) else {}
+        # Keep only comparison-safe creation settings with the account record.
+        # Proxy addresses and credentials intentionally remain out of persistence.
+        self.last_create_metadata = {
+            "profile_created": True,
+            "os": body.get("os"),
+            "os_version": body.get("osVersion") or None,
+            "random_os": random_os_enabled,
+            "random_profile_name": random_name_enabled,
+            "locale": body.get("locale") or None,
+            "random_locale": bool(getattr(_cfg, "ROXY_RANDOM_LOCALE_ON_CREATE", True)),
+            "proxy_pool_enabled": bool(getattr(_cfg, "ROXY_CREATE_USE_PROXY_POOL", False)),
+            "proxy_protocol": proxy_info.get("protocol") or proxy_info.get("proxyCategory") or None,
+            "proxy_country_code": extract_proxy_country_code(proxy_info) or None,
+        }
         return profile_id
 
     @staticmethod
@@ -433,16 +792,24 @@ class RoxyBrowserClient:
         params.setdefault("dirId", int(pid) if str(pid).isdigit() else pid)
         params.setdefault("args", [])
         params.setdefault("forceOpen", True)
+        static_cache_dir = _prepare_static_cache_dir()
+        if static_cache_dir is not None:
+            params["args"] = list(params.get("args") or []) + [f"--disk-cache-dir={static_cache_dir}"]
+        _apply_data_saver_open_args(params)
         # ROXY_OPEN_HEADLESS 是显式开关，优先级应高于 ROXY_OPEN_EXTRA_PARAMS，
         # 否则 extra 里残留 headless=False 会导致 WebUI 保存无头后仍弹窗口。
         params["headless"] = bool(getattr(_cfg, "ROXY_OPEN_HEADLESS", False))
         logger.info("[Roxy] open 参数：profile=%s headless=%s keep_open=%s", pid, params.get("headless"), getattr(_cfg, "ROXY_KEEP_BROWSER_OPEN", False))
-        result = self.request(
-            _cfg.ROXY_OPEN_METHOD,
-            path,
-            params=params if _cfg.ROXY_OPEN_METHOD.upper() == "GET" else None,
-            json_body=params if _cfg.ROXY_OPEN_METHOD.upper() != "GET" else None,
-        )
+        try:
+            result = self.request(
+                _cfg.ROXY_OPEN_METHOD,
+                path,
+                params=params if _cfg.ROXY_OPEN_METHOD.upper() == "GET" else None,
+                json_body=params if _cfg.ROXY_OPEN_METHOD.upper() != "GET" else None,
+            )
+        except Exception:
+            _cleanup_static_cache_dir(str(static_cache_dir) if static_cache_dir else None)
+            raise
         debugger_address = self._extract_debugger_address(result)
         logger.info("[Roxy] open 返回摘要: debugger=%s raw=%s", debugger_address, json.dumps(result, ensure_ascii=False)[:800])
         webdriver_url = _first(result, [
@@ -464,6 +831,7 @@ class RoxyBrowserClient:
             webdriver_url=webdriver_url,
             ws_endpoint=ws_endpoint,
             created_by_run=created_by_run,
+            static_cache_dir=str(static_cache_dir) if static_cache_dir else None,
         )
 
     def close_profile(self, profile_id: str) -> None:
@@ -524,6 +892,7 @@ class RoxyBrowserClient:
                 logger.info("[Roxy] ROXY_KEEP_BROWSER_OPEN=True，跳过删除环境：%s", opened.profile_id)
                 return
             self.delete_profile(opened.profile_id)
+        _cleanup_static_cache_dir(opened.static_cache_dir)
 
     @staticmethod
     def _extract_debugger_address(payload: dict) -> str | None:

@@ -14,6 +14,7 @@ from core.humanize import delay as human_delay
 from core import sms_provider
 from core.openai_auth import AccountUnusableError, detect_account_unusable_response_body
 from core.roxybrowser_client import RoxyBrowserClient
+from core import codex_oauth as _codex_proto
 from core.roxy_registration import (
     _build_driver,
     _center_browser_window,
@@ -21,6 +22,8 @@ from core.roxy_registration import (
     _click_continue,
     _find_any,
     _maybe_accept,
+    _human_click,
+    _human_type_text,
     _type_any,
     _type_email_address,
     _submit_email_step,
@@ -29,6 +32,7 @@ from core.roxy_registration import (
     _clear_otp_inputs,
     _email_otp_page_state,
     _is_email_verification_page,
+    _is_login_password_page,
     _click_passwordless_signup_if_present,
 )
 
@@ -209,6 +213,166 @@ def _maybe_click_passwordless_after_email(driver, email: str, timeout: int = 18)
         logger.info("[Codex][Browser] 已点击一次性验证码入口，未立即检测到 OTP 页，继续后续 OTP 轮询")
 
 
+def _wait_for_otp_input(driver, timeout: int = 30) -> None:
+    """验证码已收到但 OTP 输入框可能尚未出现（点完一次性验证码后常有中间页/延迟渲染）。
+
+    等待期间若仍停留在登录密码页，则补点一次性验证码入口（最多 2 次、间隔 6s）；
+    超时仍未出现时打印页面状态便于定位。
+    """
+    end = time.time() + timeout
+    passwordless_retries = 0
+    while time.time() < end:
+        if _is_email_verification_page(driver):
+            return
+        if _is_login_password_page(driver) and passwordless_retries < 2:
+            passwordless_retries += 1
+            result = _click_passwordless_signup_if_present(driver)
+            if result.get("ok"):
+                logger.info("[Codex][Browser] 仍停留登录密码页，补点一次性验证码入口：%s", result.get("reason"))
+                human_delay("form")
+            time.sleep(6)
+            continue
+        time.sleep(0.8)
+    state = _email_otp_page_state(driver)
+    logger.warning(
+        "[Codex][Browser] 等待 OTP 输入框超时，页面 url=%s inputs=%s buttons=%s 文本前300字=%s",
+        str(state.get("url") or ""),
+        len(state.get("inputs") or []),
+        [(b.get("text") or "")[:24] for b in (state.get("buttons") or [])][:8],
+        str(state.get("text") or "")[:300],
+    )
+    raise RuntimeError("等待 OTP 输入框超时，页面未出现验证码输入框")
+
+
+def _account_password_for_email(email: str) -> str:
+    try:
+        return _codex_proto._account_registration_password(email)
+    except Exception:
+        return ""
+
+
+def _account_totp_code_for_email(email: str) -> str:
+    try:
+        return _codex_proto._account_totp_code(email)
+    except Exception:
+        return ""
+
+
+def _is_mfa_challenge_page(driver) -> bool:
+    try:
+        url = str(driver.current_url or "").lower()
+        if "/mfa-challenge/" in url or "/mfa-challenge" in url:
+            return True
+        state = driver.execute_script(r"""
+        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+        const form = [...document.querySelectorAll('form')].find(f => /\/mfa-challenge/i.test(f.getAttribute('action') || ''));
+        const input = form ? [...form.querySelectorAll('input[name="code"], input[autocomplete="one-time-code"], input[maxlength="6"]')].find(visible) : null;
+        return {ok: !!(form && input), url: location.href};
+        """) or {}
+        return bool(state.get("ok"))
+    except Exception:
+        return False
+
+
+def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> bool:
+    """如果当前进入 MFA challenge 页面，自动填入账号 TOTP 并提交。"""
+    code = _account_totp_code_for_email(email)
+    if not code:
+        return False
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if not _is_mfa_challenge_page(driver):
+                time.sleep(0.4)
+                continue
+            result = driver.execute_script(r"""
+            const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+              && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+              && !el.disabled && !el.readOnly;
+            const form = [...document.querySelectorAll('form')].find(f => /\/mfa-challenge/i.test(f.getAttribute('action') || ''));
+            if (!form) return {ok:false, reason:'missing_form'};
+            const input = [...form.querySelectorAll('input[name="code"], input[autocomplete="one-time-code"], input[maxlength="6"]')].find(visible);
+            if (!input) return {ok:false, reason:'missing_code_input'};
+            const button = [...form.querySelectorAll('button[type="submit"], button[data-dd-action-name="Continue"], button')].find(visible);
+            if (!button) return {ok:false, reason:'missing_submit'};
+            return {ok:true, input, button};
+            """) or {}
+            if not result.get("ok"):
+                time.sleep(0.4)
+                continue
+            _human_type_text(driver, result.get("input"), code, clear=True)
+            human_delay("otp_input")
+            _human_click(driver, result.get("button"), label="codex_mfa_submit")
+            logger.info("[Codex][Browser] 已填写并提交 MFA 验证码：%s", email)
+            wait_end = time.time() + 12
+            while time.time() < wait_end:
+                if not _is_mfa_challenge_page(driver):
+                    return True
+                time.sleep(0.4)
+            return True
+        except Exception as exc:
+            logger.debug("[Codex][Browser] MFA challenge 处理失败：%s", str(exc)[:160])
+            time.sleep(0.5)
+    return False
+
+
+def _fill_login_password_if_present(driver, email: str, timeout: int = 18) -> str | None:
+    """Codex OAuth 若账号有密码，优先在登录密码页输入密码。返回 next_step / email_otp / None。"""
+    password = _account_password_for_email(email)
+    if not password:
+        return None
+    end = time.time() + timeout
+    while time.time() < end:
+        if _is_email_verification_page(driver):
+            return "email_otp"
+        if not _is_login_password_page(driver):
+            time.sleep(0.4)
+            continue
+        result = driver.execute_script(r"""
+        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+          && !el.disabled && !el.readOnly;
+        const input = [...document.querySelectorAll('input[type="password"],input[name*="password" i],input[autocomplete="current-password"]')]
+          .find(visible);
+        if (!input) return {ok:false, reason:'missing_password_input'};
+        const form = input.closest('form');
+        const scope = form || document;
+        const buttons = [...scope.querySelectorAll('button,input[type="submit"]')]
+          .filter(el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true')
+          .map((el, idx) => {
+            const r = el.getBoundingClientRect();
+            const ir = input.getBoundingClientRect();
+            return {el, idx, below: r.top >= ir.bottom - 10, dist: Math.max(0, r.top - ir.bottom) + Math.abs((r.left+r.right-ir.left-ir.right)/2)/10};
+          })
+          .filter(x => x.below)
+          .sort((a,b) => a.dist - b.dist || a.idx - b.idx);
+        if (!buttons.length) return {ok:false, reason:'missing_submit'};
+        buttons[0].el.scrollIntoView({block:'center'});
+        return {ok:true, reason:'password_targets', input, button: buttons[0].el};
+        """) or {}
+        if not result.get("ok"):
+            logger.info("[Codex][Browser] 登录密码页未找到输入/提交按钮：%s", result)
+            time.sleep(0.5)
+            continue
+        _human_type_text(driver, result.get("input"), password, clear=True)
+        human_delay("form", minimum=2.0, maximum=3.6)
+        _human_click(driver, result.get("button"), label="codex_password_submit")
+        logger.info("[Codex][Browser] 已填写并提交登录密码：%s", email)
+        wait_end = time.time() + 12
+        while time.time() < wait_end:
+            if _is_mfa_challenge_page(driver):
+                _fill_mfa_challenge_if_present(driver, email, timeout=15)
+                return "next_step"
+            if _is_email_verification_page(driver):
+                return "email_otp"
+            if not _is_login_password_page(driver):
+                return "next_step"
+            time.sleep(0.5)
+        return "next_step"
+    return None
+
+
 def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][Browser] 打开授权地址")
@@ -226,7 +390,16 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
         human_delay("form")
         _submit_email_step(driver)
         logger.info("[Codex][Browser] 已提交邮箱，等待邮箱 OTP 页面")
-        _maybe_click_passwordless_after_email(driver, email, timeout=18)
+        pw_result = _fill_login_password_if_present(driver, email, timeout=18)
+        if pw_result == "next_step":
+            if _is_mfa_challenge_page(driver):
+                _fill_mfa_challenge_if_present(driver, email, timeout=15)
+            logger.info("[Codex][Browser] 账号已用密码完成登录，直接进入后续步骤")
+            return
+        if pw_result == "email_otp":
+            logger.info("[Codex][Browser] 密码登录后仍进入邮箱 OTP 页面")
+        else:
+            _maybe_click_passwordless_after_email(driver, email, timeout=18)
     except Exception as exc:
         logger.info("[Codex][Browser] 未检测到邮箱输入框，可能已登录或进入下一步：%s", str(exc)[:120])
         return
@@ -250,7 +423,14 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
             human_delay("form")
             _submit_email_step(driver)
             logger.info("[Codex][Browser] 已重新提交邮箱触发 OTP")
-            _maybe_click_passwordless_after_email(driver, email, timeout=12)
+            pw_result = _fill_login_password_if_present(driver, email, timeout=12)
+            if pw_result == "next_step":
+                if _is_mfa_challenge_page(driver):
+                    _fill_mfa_challenge_if_present(driver, email, timeout=15)
+                logger.info("[Codex][Browser] 重新提交邮箱后已用密码完成登录，进入后续步骤")
+                return
+            if pw_result != "email_otp":
+                _maybe_click_passwordless_after_email(driver, email, timeout=12)
         except Exception as exc:
             # 如果重进授权地址后已经停在验证码/下一步页面，就不要再强行提交。
             if not _is_email_verification_page(driver):
@@ -283,6 +463,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
             continue
         used_codes.add(str(code))
         logger.info("[Codex][Browser] 邮箱 OTP 收到：%s", code)
+        _wait_for_otp_input(driver, timeout=30)
         _clear_otp_inputs(driver)
         _type_otp(driver, code)
         logger.info("[Codex][Browser] 已填写邮箱 OTP")
@@ -302,6 +483,9 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
 
         outcome = _wait_after_email_otp_submit(driver, timeout=45)
         logger.info("[Codex][Browser] 邮箱 OTP 提交后状态：%s", outcome)
+        if _is_mfa_challenge_page(driver):
+            _fill_mfa_challenge_if_present(driver, email, timeout=15)
+            return
         if outcome == "accepted":
             return
         if str(outcome).startswith("deactivated:"):
@@ -428,13 +612,9 @@ def _read_email_otp_validate_dead_code(driver) -> str:
     return ""
 
 
-def _is_email_verification_page(driver) -> bool:
-    try:
-        url = str(driver.current_url or "").lower()
-        return "email-verification" in url
-    except Exception:
-        return False
-
+# 邮箱验证码页判断复用 roxy_registration 的强版本（URL + 输入框属性识别，
+# 且明确排除 /log-in/password），不使用本地弱化版，避免点完一次性验证码后
+# 页面已渲染 OTP 输入框却因 URL 不含 email-verification 而识别失败。
 
 def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
     """
@@ -1094,12 +1274,22 @@ def _do_phone_verification_if_present(driver) -> None:
                 return
             except Exception as exc:
                 last_err = exc
-                logger.warning("[Codex][Browser] 手机验证尝试失败，换号：%s", str(exc)[:240])
+                err_text = str(exc) or ""
+                logger.warning("[Codex][Browser] 手机验证尝试失败，换号：%s", err_text[:240])
                 if activation_id:
                     try:
                         sms_provider.cancel(activation_id, http)
                     except Exception:
                         pass
+                # 余额不足 / 无可用号码：重试多少次都不会成功，立即失败止损，
+                # 避免白等 N 轮换号重试（每轮还要刷新页面 + 随机等待）。
+                if any(k in err_text for k in (
+                    "NO_BALANCE", "NO_NUMBERS", "BALANCE", "余额不足",
+                    "暂无可用号码", "没有可用号码", "insufficient", "not enough balance",
+                )):
+                    raise RuntimeError(
+                        f"接码平台余额不足或无可用号码，已停止换号止损：{err_text[:180]}"
+                    ) from exc
                 if "invalid_auth_step" in str(exc):
                     raise RuntimeError(
                         "手机号流程进入 invalid_auth_step，说明授权状态还未从 email-verification 正常跳转或已失效；"
@@ -1305,7 +1495,7 @@ def _run_roxy_codex_oauth_once(
 
         if not code_verifier:
             raise RuntimeError("[Codex][Browser] local 模式缺少 code_verifier")
-        session = proto.BrowserSession(proxy=proxy)
+        session = proto.BrowserSession(proxy=proxy, fingerprint_seed=f"account:{email.lower()}")
         token_resp = proto.exchange_codex_token(session, code, code_verifier)
         id_claims = proto._parse_id_token(token_resp.get("id_token", ""))
         effective_email = id_claims.get("email") or email

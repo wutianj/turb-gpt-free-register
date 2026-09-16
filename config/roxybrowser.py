@@ -71,11 +71,35 @@ ROXY_ONE_PROFILE_PER_ACCOUNT: bool = True
 # 一号一环境结束后是否删除 Profile。建议保持 True。
 ROXY_DELETE_PROFILE_AFTER_RUN: bool = True
 
+# 跨任务只复用 Chromium HTTP 静态资源缓存。每个任务使用模板的私有副本，
+# 不共享 Profile、Cookie、LocalStorage 或登录状态。
+ROXY_STATIC_CACHE_ENABLED: bool = True
+ROXY_STATIC_CACHE_TEMPLATE_DIR: str = "data/roxy-static-cache-template"
+
 # 删除环境接口路径/方法；如你的 Roxy 版本不同，只改这里。
 ROXY_DELETE_PATH: str = "/browser/delete"
 ROXY_DELETE_METHOD: str = "POST"
 
-# 创建 Roxy 环境时默认系统指纹。Roxy 官方 os 枚举：Windows / macOS / Linux / IOS / Android。
+# 创建 Roxy 环境时固定使用已验证稳定的默认系统指纹。随机跨 Windows/macOS
+# 会同时改变 UA、平台与底层指纹组合，注册链路的 OTP 投递成功率不可复现。
+ROXY_RANDOM_OS_ON_CREATE: bool = False
+ROXY_RANDOM_OS_CHOICES: str = "Windows,macOS"
+
+# 创建 Roxy 环境时随机语言/时区。仅本地无限窗口 API（roxy-api.mjs）支持：
+# 会把 locale 展开成 appLocale / acceptLang / timeZone 三个互相一致的字段写入
+# 每个档案的 lumi.conf；官方 API 不认识该字段，会忽略，不影响兼容性。
+ROXY_RANDOM_LOCALE_ON_CREATE: bool = True
+ROXY_LOCALE_CHOICES: str = (
+    "en-US,pt-BR,en-GB,es-ES,es-MX,de-DE,fr-FR,it-IT,nl-NL,pl-PL,"
+    "ru-RU,tr-TR,ja-JP,ko-KR,zh-CN,zh-TW,hi-IN,id-ID,th-TH,vi-VN,ar-SA"
+)
+
+# 创建 Roxy 环境时随机名称；开启后会覆盖 ROXY_PROFILE_CREATE_PAYLOAD 里的固定 name。
+ROXY_RANDOM_PROFILE_NAME_ON_CREATE: bool = True
+ROXY_PROFILE_NAME_PREFIX: str = "rb"
+
+# 创建 Roxy 环境时默认系统指纹。仅在 ROXY_RANDOM_OS_ON_CREATE=False 时使用。
+# Roxy 官方 os 枚举：Windows / macOS / Linux / IOS / Android。
 ROXY_DEFAULT_OS: str = "macOS"
 # 留空则使用 Roxy 对应系统的默认/最大版本；如需固定可填 15.3.2、14.7 等。
 ROXY_DEFAULT_OS_VERSION: str = ""
@@ -85,10 +109,15 @@ ROXY_DEFAULT_OS_VERSION: str = ""
 #   True  = 每次创建环境时从 PROXY_POOL 随机取一个代理写入 proxyInfo
 ROXY_CREATE_USE_PROXY_POOL: bool = False
 
+# 代理池使用 host:port 或 host:port:user:password 格式时的协议。
+# 显式 http://、https://、socks5://、socks5h:// 前缀始终优先于此配置。
+ROXY_PROXY_DEFAULT_PROTOCOL: str = "http"
+
 # Roxy 代理检测通道；留空则不传 checkChannel。
 ROXY_PROXY_CHECK_CHANNEL: str = "IPRust.io"
 
 # 没有 ROXY_PROFILE_ID 时创建环境的最小 payload；按你的 Roxy 版本字段调整。
+# 默认开启 ROXY_RANDOM_PROFILE_NAME_ON_CREATE，因此这里的 name 只是兜底值。
 ROXY_PROFILE_CREATE_PAYLOAD: dict = {
     "name": "gpt-free-register",
     "os": "macOS",
@@ -99,4 +128,4 @@ ROXY_PROFILE_CREATE_PAYLOAD: dict = {
 ROXY_CODEX_CALLBACK_TIMEOUT: int = 180
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'REGISTRATION_DRIVER': 'str', 'ROXY_API_BASE': 'str', 'ROXY_API_TOKEN': 'str', 'ROXY_PROFILE_ID': 'str', 'ROXY_WORKSPACE_ID': 'str', 'ROXY_PROJECT_ID': 'str', 'ROXY_WORKSPACE_LIST_PATH': 'str', 'ROXY_OPEN_PATH': 'str', 'ROXY_OPEN_HEADLESS': 'bool', 'ROXY_CLOSE_PATH': 'str', 'ROXY_KEEP_BROWSER_OPEN': 'bool', 'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool', 'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool', 'ROXY_CREATE_USE_PROXY_POOL': 'bool', 'ROXY_PROXY_CHECK_CHANNEL': 'str', 'ROXY_DELETE_PATH': 'str', 'ROXY_CODEX_CALLBACK_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'REGISTRATION_DRIVER': 'str', 'ROXY_API_BASE': 'str', 'ROXY_API_TOKEN': 'str', 'ROXY_PROFILE_ID': 'str', 'ROXY_WORKSPACE_ID': 'str', 'ROXY_PROJECT_ID': 'str', 'ROXY_WORKSPACE_LIST_PATH': 'str', 'ROXY_OPEN_PATH': 'str', 'ROXY_OPEN_HEADLESS': 'bool', 'ROXY_CLOSE_PATH': 'str', 'ROXY_KEEP_BROWSER_OPEN': 'bool', 'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool', 'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool', 'ROXY_RANDOM_OS_ON_CREATE': 'bool', 'ROXY_RANDOM_OS_CHOICES': 'str', 'ROXY_RANDOM_LOCALE_ON_CREATE': 'bool', 'ROXY_LOCALE_CHOICES': 'str', 'ROXY_PROFILE_NAME_PREFIX': 'str', 'ROXY_CREATE_USE_PROXY_POOL': 'bool', 'ROXY_PROXY_DEFAULT_PROTOCOL': 'str', 'ROXY_PROXY_CHECK_CHANNEL': 'str', 'ROXY_DELETE_PATH': 'str', 'ROXY_CODEX_CALLBACK_TIMEOUT': 'int'})

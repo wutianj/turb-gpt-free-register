@@ -12,11 +12,14 @@
 import ast
 import os
 import re
+import tempfile
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
-EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL"}
+EXPLICIT_EMPTY_LIST_KEYS = {
+    "PROXY_POOL",
+}
 
 
 # ============================================================
@@ -48,6 +51,10 @@ EDITABLE_FIELDS = [
     {
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "注册方式",
         "label": "注册驱动", "help": "默认推荐 roxy；protocol=纯协议，容易封号不建议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright",
+    },
+    {
+        "key": "AUTO_PLAN_CHECK_AFTER_REGISTER", "file": "register.py", "type": "bool", "group": "注册方式",
+        "label": "注册后自动查套餐", "help": "注册成功后自动入队查询套餐/Plus 资格；关闭后仅保存账号，不自动查套餐",
     },
 
     # ---- CloakBrowser ----
@@ -235,6 +242,22 @@ EDITABLE_FIELDS = [
         "label": "结束后删除环境", "help": "一号一环境模式下，任务结束后删除本轮创建的 Roxy Profile",
     },
     {
+        "key": "ROXY_RANDOM_OS_ON_CREATE", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "label": "创建环境随机OS", "help": "创建 Roxy 环境时每次在 Windows / macOS 中随机，不固定 macOS",
+    },
+    {
+        "key": "ROXY_RANDOM_OS_CHOICES", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "随机OS范围", "help": "逗号分隔，默认 Windows,macOS；Roxy 支持 Windows / macOS / Linux / IOS / Android",
+    },
+    {
+        "key": "ROXY_RANDOM_PROFILE_NAME_ON_CREATE", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
+        "label": "创建环境随机名称", "help": "创建 Roxy 环境时自动生成不同名称，避免固定 gpt-free-register",
+    },
+    {
+        "key": "ROXY_PROFILE_NAME_PREFIX", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
+        "label": "随机名称前缀", "help": "默认 rb；实际名称格式类似 rb-时间戳-随机码",
+    },
+    {
         "key": "ROXY_CREATE_USE_PROXY_POOL", "file": "roxybrowser.py", "type": "bool", "group": "RoxyBrowser",
         "label": "创建环境使用代理池", "help": "创建 Roxy 环境时从配置页「代理池」随机取一个代理，写入 Roxy proxyInfo",
     },
@@ -270,6 +293,10 @@ EDITABLE_FIELDS = [
         "key": "HUMANIZE_DELAY_FACTOR", "file": "humanize.py", "type": "float", "group": "人工节奏",
         "label": "停顿倍率", "help": "随机停顿整体倍率；1.0=默认，0.5=减半，2.0=加倍",
     },
+    {
+        "key": "ENABLE_HUMANIZE_BROWSER_ACTIONS", "file": "humanize.py", "type": "bool", "group": "人工节奏",
+        "label": "浏览器动作随机化", "help": "Roxy/Cloak 点击、输入、页面观察使用随机鼠标落点和逐字输入，降低机械操作痕迹",
+    },
     # ---- 邮箱 / OTP ----
     {
         "key": "USE_EMAIL_SERVICE", "file": "email.py", "type": "bool", "group": "邮箱 / OTP",
@@ -293,7 +320,11 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,remail",
+    },
+    {
+        "key": "IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "通用 IMAP 收件箱", "help": "通用 IMAP 邮箱默认目录，通常为 INBOX；服务器、端口、用户名和密码在邮箱池导入",
     },
     {
         "key": "GPTMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -408,6 +439,41 @@ EDITABLE_FIELDS = [
         "key": "CLOUDMAIL_RANDOM_LOCAL_LENGTH", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "CloudMail随机名前缀长度", "help": "生成邮箱 local-part 的长度，建议 10-16",
     },
+    {
+        "key": "REMAIL_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail API 地址", "help": "默认 https://remail.aishop6.com；也可填写文档地址 https://remail.aishop6.com/docs",
+        "external_url": "https://remail.aishop6.com/register?aff=AFFLGYQMTYIXH",
+        "external_label": "打开 Remail 官网",
+    },
+    {
+        "key": "REMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail API Key", "help": "Remail 控制台生成的 rk- 开头 API Key；选择 remail 来源时必填，保存在 .env",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "REMAIL_PROJECT_ID", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Remail 项目 ID", "help": "Remail API 项目列表中的 projectId，用于匹配 ChatGPT/OpenAI 验证码项目",
+    },
+    {
+        "key": "REMAIL_EMAIL_SUFFIX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail 邮箱后缀", "help": "下单时使用的邮箱后缀，默认 outlook.com；不要填写完整邮箱",
+    },
+    {
+        "key": "REMAIL_SERVICE_MODE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail 服务模式", "help": "code=短效接码；purchase=长效购买（可重复收件，默认）",
+    },
+    {
+        "key": "REMAIL_SUPPLY_POLICY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail 库存策略", "help": "private_first 优先自有库存；public_only 只使用公开库存（默认）",
+    },
+    {
+        "key": "REMAIL_ORDER_WAIT_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Remail 订单等待(秒)", "help": "下单后未立即返回 service token 时等待订单补齐凭证，默认 30 秒",
+    },
+    {
+        "key": "REMAIL_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Remail 请求超时(秒)", "help": "Remail API 单次 HTTP 请求超时，默认 20 秒",
+    },
     # ---- 浏览器地区画像 ----
     {
         "key": "BROWSER_LOCALE_PROFILE", "file": "browser.py", "type": "str", "group": "浏览器画像",
@@ -422,11 +488,55 @@ EDITABLE_FIELDS = [
         "key": "IP_GEO_TIMEOUT", "file": "browser.py", "type": "float", "group": "浏览器画像",
         "label": "IP定位超时(秒)", "help": "出口 IP 地理信息接口的单次请求超时；接口失败会自动回退，不影响注册",
     },
+    {
+        "key": "BROWSER_DATA_SAVER_MODE", "file": "browser.py", "type": "bool", "group": "浏览器画像",
+        "label": "本地浏览器省流量模式", "help": "仅 Roxy/Cloak 本地浏览器拦截图片和媒体等可选资源；Browser Use/Skyvern 云端浏览器不启用；默认关闭",
+    },
+    {
+        "key": "BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES", "file": "browser.py", "type": "list_str_multiline", "group": "浏览器画像",
+        "label": "本地浏览器省流量拦截类型", "help": "仅 Roxy/Cloak 生效；每行一种，默认 image、media；可选 stylesheet、font、manifest、texttrack。不要填写 script/xhr/fetch/document/websocket",
+    },
+    {
+        "key": "BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS", "file": "browser.py", "type": "list_str_multiline", "group": "浏览器画像",
+        "label": "本地浏览器省流量 URL 屏蔽规则", "help": "仅 Roxy/Cloak 生效；每行一条 URL glob；默认拦截 RUM/广告统计和 Google GSI（不用 Google 登录时）。不要屏蔽核心 API/sentinel；填 [] 可关闭默认规则",
+    },
+    {
+        "key": "BROWSER_TRAFFIC_DETAIL_LOG", "file": "browser.py", "type": "bool", "group": "浏览器画像",
+        "label": "本地浏览器流量明细日志", "help": "仅 Roxy/Cloak 生效；注册结束时输出每个资源的 URL、类型、方法、状态码和上传/下载大小；URL 查询值会脱敏，默认关闭",
+    },
+    {
+        "key": "BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES", "file": "browser.py", "type": "int", "group": "浏览器画像",
+        "label": "流量明细最多条数", "help": "按单请求总字节降序输出，默认 2000，最大 10000；用于后续分析可屏蔽资源",
+    },
+    {
+        "key": "BROWSER_JS_COVERAGE_LOG", "file": "browser.py", "type": "bool", "group": "浏览器画像",
+        "label": "记录本地浏览器 JS 覆盖率", "help": "仅 Roxy/Cloak 生效；通过 Chrome CDP 记录本次注册实际执行的 JS 函数和 offset；Browser Use/Skyvern 不启用；默认关闭",
+    },
+    {
+        "key": "BROWSER_JS_COVERAGE_MAX_ENTRIES", "file": "browser.py", "type": "int", "group": "浏览器画像",
+        "label": "本地浏览器 JS 覆盖率最多条数", "help": "仅 Roxy/Cloak 生效；日志最多输出的已执行函数数，同时限制保存的脚本摘要数量，默认 1000，最大 10000",
+    },
 
     # ---- 代理池 ----
     {
         "key": "PROXY_POOL", "file": "proxy.py", "type": "list_str_multiline", "group": "代理池",
         "label": "代理池(每行一个)", "help": "每行一个代理 URL，留空行会被忽略；为空则不使用代理",
+        "recommended_links": [
+            {
+                "label": "IPRocket 家宽",
+                "url": "https://iprocket.io?viteCode=1PVNyLuJ",
+                "description": "高性价比家宽，可通过 TG 联系作者购买流量",
+            },
+            {
+                "label": "Rola-IP 家宽",
+                "url": "https://rola-ip.co/?code=0326C5HA",
+                "description": "Roxy 合作伙伴高质量家宽，注册可享 15% 优惠",
+            },
+        ],
+    },
+    {
+        "key": "PROXY_DEFAULT_PROTOCOL", "file": "proxy.py", "type": "str", "group": "代理池",
+        "label": "代理池默认协议", "help": "仅用于 host:port 或 host:port:用户名:密码 格式；可选 http、https、socks5、socks5h，带 scheme 前缀的代理不受影响",
     },
     {
         "key": "PLAN_CHECK_PROXY_MODE", "file": "proxy.py", "type": "str", "group": "代理池",
@@ -443,7 +553,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "PLAN_CHECK_MAX_ATTEMPTS", "file": "proxy.py", "type": "int", "group": "代理池",
-        "label": "套餐/Agent最大尝试次数", "help": "查套餐和生成 Agent Token 遇到网络错误、429、5xx 等临时错误时的重试次数，建议 2 次",
+        "label": "套餐/Agent最大尝试次数", "help": "查套餐和生成 Agent Token 遇到 403、429、5xx 或网络错误时的重试次数，建议 3 次",
     },
     {
         "key": "PLAN_CHECK_RETRY_DELAY", "file": "proxy.py", "type": "float", "group": "代理池",
@@ -468,6 +578,14 @@ EDITABLE_FIELDS = [
     {
         "key": "PLAN_CHECK_JITTER", "file": "proxy.py", "type": "float", "group": "代理池",
         "label": "套餐/Agent请求随机抖动(秒)", "help": "在查套餐和生成 Agent Token 的最小间隔上增加随机延迟，避免请求过于规律",
+    },
+    {
+        "key": "MOMO_CHECK_WORKERS", "file": "proxy.py", "type": "int", "group": "代理池",
+        "label": "MoMo检测并发数", "help": "MoMo 检测使用独立低并发队列，复用套餐查询网络策略；建议 1-2",
+    },
+    {
+        "key": "MOMO_CHECK_TIMEOUT", "file": "proxy.py", "type": "float", "group": "代理池",
+        "label": "MoMo检测超时(秒)", "help": "单账号创建未确认 Checkout 与读取 Stripe 支付方式的超时；建议 15-30 秒",
     },
     # ---- 提链 ----
     {
@@ -763,6 +881,17 @@ def get_config() -> list[dict]:
         else:
             value = fallback
 
+        if key == "PROXY_POOL":
+            proxy_file = str(env_file_values.get("PROXY_POOL_FILE") or os.getenv("PROXY_POOL_FILE") or "").strip()
+            if proxy_file:
+                proxy_path = Path(proxy_file)
+                if proxy_path.is_file():
+                    value = [
+                        line.strip()
+                        for line in proxy_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip() and not line.lstrip().startswith("#")
+                    ]
+
         if field["type"] in ("str", "list_str_multiline"):
             value = _normalize_config_value(value, field["type"])
         item = dict(field)
@@ -902,15 +1031,32 @@ def _format_env_value(value, vtype: str) -> str:
 
 def update_config(updates: dict) -> dict:
     """批量更新配置。所有 WebUI 可编辑项只写项目根 `.env`。"""
-    from config.env_loader import write_env_values, load_env
+    from config.env_loader import write_env_values, load_env, read_env_file
 
     updated, ignored = [], []
     env_updates: dict[str, str] = {}
+    load_env(override=True)
+    env_file_values = read_env_file()
+    proxy_file = str(env_file_values.get("PROXY_POOL_FILE") or os.getenv("PROXY_POOL_FILE") or "").strip()
 
     for key, value in updates.items():
         field = _FIELD_BY_KEY.get(key)
         if field is None:
             ignored.append(key)
+            continue
+        if key == "PROXY_POOL" and proxy_file:
+            proxy_path = Path(proxy_file)
+            proxy_path.parent.mkdir(parents=True, exist_ok=True)
+            lines = _normalize_config_value(value, "list_str_multiline")
+            fd, temp_name = tempfile.mkstemp(prefix=proxy_path.name + ".", suffix=".tmp", dir=str(proxy_path.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+                    handle.write("\n".join(lines) + ("\n" if lines else ""))
+                os.replace(temp_name, proxy_path)
+            finally:
+                if os.path.exists(temp_name):
+                    os.unlink(temp_name)
+            updated.append(key)
             continue
         env_updates[key] = _format_env_value(value, field["type"])
         updated.append(key)

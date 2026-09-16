@@ -90,25 +90,32 @@ def _append_job_log(job_id: int, message: str) -> None:
         pass
 
 
+def _job_progress(job_id: int, message: str) -> None:
+    """持久化任务阶段，避免生产日志等级过滤掉所有 INFO 时出现空日志。"""
+    try:
+        job = db.get_job(job_id)
+        log_file = job.get("log_file") if job else None
+        if not log_file:
+            return
+        path = Path(log_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(f"{datetime.now():%H:%M:%S} [INFO] [job-{job_id}] {message}\n")
+    except Exception:
+        logger.exception("[Service] 写入任务进度失败: %s", job_id)
+
+
 def _random_display_name() -> str:
     """生成符合 OpenAI 限制的英文字母显示名。"""
-    import random
-    import string
+    from core.name_samples import random_display_name
 
-    first = random.choice(string.ascii_uppercase) + "".join(
-        random.choices(string.ascii_lowercase, k=random.randint(3, 6))
-    )
-    last = random.choice(string.ascii_uppercase) + "".join(
-        random.choices(string.ascii_lowercase, k=random.randint(3, 6))
-    )
-    return f"{first} {last}"
+    return random_display_name()
 
 
-def _prepare_registration_args() -> tuple[str, str, str]:
+def _prepare_registration_args() -> tuple[str | None, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
     from config import register as _r, email as _e
-    from core.email_provider import acquire_email
     from core.profile_utils import generate_random_birthday
 
     email = str(getattr(_r, "REGISTER_EMAIL", "") or "").strip()
@@ -123,15 +130,14 @@ def _prepare_registration_args() -> tuple[str, str, str]:
 
     birthday = generate_random_birthday()
 
-    # 邮箱领取会把池状态置为 used，因此放在所有其他准备逻辑之后。
-    if not email:
-        if _e.USE_EMAIL_SERVICE:
-            email = acquire_email()
-        else:
-            raise RuntimeError(
-                "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
-                "或开启 USE_EMAIL_SERVICE 并从邮箱池领取。"
-            )
+    # 自动邮箱不在准备阶段领取：浏览器驱动会等页面找到邮箱输入框后再领取，
+    # 协议驱动则在 run_registration 即将开始认证时领取。这样页面打不开/找不到
+    # 输入框时不会提前消耗邮箱订单或池中素材。
+    if not email and not _e.USE_EMAIL_SERVICE:
+        raise RuntimeError(
+            "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
+            "或开启 USE_EMAIL_SERVICE 并从邮箱池领取。"
+        )
 
     return email, name, birthday
 
@@ -148,46 +154,30 @@ def _release_unconsumed_job_email(email: str | None, reason: str) -> None:
         logger.exception("[Service] 回收未消耗邮箱失败: %s", email)
 
 
-def _is_final_session_access_token_timeout(error: object) -> bool:
-    """
-    识别注册最后一步已经返回 /api/auth/session 200 但没有 accessToken 的失败。
-    这种邮箱后续继续注册通常会卡在同一状态，按要求直接停用邮箱池条目。
-    """
-    text = str(error or "")
-    if not text:
-        return False
-    return (
-        "等待 /api/auth/session accessToken 超时" in text
-        and "WARNING_BANNER" in text
-        and "'_http_status': 200" in text
-    )
+def _should_mark_failed_registration_email_used(error: object) -> bool:
+    """需要保留在“已用”池、禁止后续再次领取的注册失败。"""
+    from core.email_provider import registration_failure_consumes_email
+
+    return registration_failure_consumes_email(error)
 
 
 def _should_disable_failed_registration_email(error: object) -> bool:
-    """需要直接停用邮箱的注册失败类型。"""
-    text = str(error or "")
-    if not text:
-        return False
-    return (
-        _is_final_session_access_token_timeout(text)
-        or "邮箱提交后进入登录密码页" in text
-        or "auth.openai.com/log-in/password" in text
-        or "/log-in/password" in text
-    )
+    """兼容旧测试/调用方；终态失败现在统一标记为 used。"""
+    return _should_mark_failed_registration_email_used(error)
 
 
-def _disable_job_email(email: str | None, reason: str) -> bool:
-    """把本次任务邮箱停用，避免后续再次领取。"""
+def _mark_job_email_used(email: str | None, reason: str) -> bool:
+    """把已提交或已注册邮箱标记为 used，避免后续再次领取。"""
     if not email:
         return False
     try:
-        from core.email_provider import release_email
+        from core.email_provider import mark_registration_email_used
 
-        source = release_email(email, status="disabled", note=f"自动停用: {reason[:180]}")
-        logger.warning("[Service] 已自动停用邮箱: source=%s email=%s reason=%s", source, email, reason[:220])
+        source = mark_registration_email_used(email, reason)
+        logger.warning("[Service] 已自动标记邮箱为已用: source=%s email=%s reason=%s", source, email, reason[:220])
         return True
     except Exception:
-        logger.exception("[Service] 自动停用邮箱失败: %s", email)
+        logger.exception("[Service] 自动标记已用邮箱失败: %s", email)
         return False
 
 
@@ -299,6 +289,9 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         return
 
     db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+    _job_progress(job_id, "开始注册，准备浏览器与邮箱")
+    from core.email_provider import set_job_email_source, clear_job_email_source
+    set_job_email_source(current.get("email_source"))
 
     email: str | None = None
     try:
@@ -308,12 +301,26 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             email, name, birthday = _prepare_registration_args()
             db.update_job(job_id, email=email)
             check_stop_requested()
-            result = run_registration(email=email, name=name, birthday=birthday)
+            def _on_email_acquired(acquired_email: str) -> None:
+                nonlocal email
+                email = str(acquired_email or "").strip() or None
+                if email:
+                    db.update_job(job_id, email=email)
+                    _job_progress(job_id, "已分配邮箱，继续注册及收码")
+                    log_logger.info(f"[Job {job_id}] 页面已找到邮箱输入框，已分配邮箱: {email}")
+
+            result = run_registration(
+                email=email,
+                name=name,
+                birthday=birthday,
+                on_email_acquired=_on_email_acquired,
+            )
             if is_stop_requested(job_id):
                 _release_unconsumed_job_email(email, "用户手动停止")
                 db.update_job(
                     job_id,
                     status="stopped",
+                    network_traffic=(result or {}).get("network_traffic") if isinstance(result, dict) else None,
                     error="用户手动停止",
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
@@ -325,9 +332,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     status="success",
                     email=result.get("email"),
                     account_id=result.get("account_id"),
+                    network_traffic=result.get("network_traffic"),
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
+                _job_progress(job_id, "注册完成，账号已保存")
             else:
                 # 注意：失败也可能伴随 account_id（如 Codex 失败但账号已注册成功）
                 err = (result or {}).get("error") if isinstance(result, dict) else "unknown"
@@ -337,16 +346,19 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     status="failed",
                     email=result_email,
                     account_id=(result or {}).get("account_id") if isinstance(result, dict) else None,
+                    network_traffic=(result or {}).get("network_traffic") if isinstance(result, dict) else None,
                     error=str(err)[:500],
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 email_to_handle = str(result_email or email or "").strip()
-                if _should_disable_failed_registration_email(err):
-                    _disable_job_email(email_to_handle, str(err))
+                if _should_mark_failed_registration_email_used(err):
+                    _mark_job_email_used(email_to_handle, str(err))
                 else:
                     _release_unconsumed_job_email(email_to_handle, str(err))
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
+                _job_progress(job_id, "注册失败；请查看任务状态及错误列")
     except StopRequested as exc:
+        _job_progress(job_id, "任务已停止")
         _release_unconsumed_job_email(email, str(exc))
         log_logger.warning(f"[Job {job_id}] 已停止: {exc}")
         db.update_job(
@@ -356,9 +368,10 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
     except Exception as exc:
+        _job_progress(job_id, f"任务异常: {type(exc).__name__}")
         err_text = f"{type(exc).__name__}: {exc}"
-        if _should_disable_failed_registration_email(err_text):
-            _disable_job_email(email, err_text)
+        if _should_mark_failed_registration_email_used(err_text):
+            _mark_job_email_used(email, err_text)
         else:
             _release_unconsumed_job_email(email, err_text)
         if is_stop_requested(job_id):
@@ -378,6 +391,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
     finally:
+        clear_job_email_source()
         _deactivate_job(job_id)
 
 
@@ -437,7 +451,7 @@ def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int
 def submit_registration(count: int = 1, email_source: str | None = None, workers: int | None = None) -> list[dict]:
     """
     创建 N 个注册任务并提交到线程池。
-    email_source 仅记录到 DB；实际邮箱来源固定为 Outlook 账号池。
+    email_source 保存到 DB，由任务线程用于邮箱领取。
 
     Returns:
         N 个新创建的 job dict
