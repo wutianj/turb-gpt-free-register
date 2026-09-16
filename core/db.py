@@ -481,6 +481,11 @@ def _account_filter_sql(
             where.append(f"{plan_expr} = ?")
             where.append(f"{half_price_expr} IN (?, ?, ?, ?)")
             params.extend(["free", "1", "true", "yes", "on"])
+        elif plan in {"zero_price", "plus_zero_price", "zero_price_trial"}:
+            zero_price_expr = "lower(COALESCE(CAST(json_extract(payload, '$.plus_zero_price_eligible') AS TEXT), ''))"
+            where.append(f"{plan_expr} = ?")
+            where.append(f"{zero_price_expr} IN (?, ?, ?, ?)")
+            params.extend(["free", "1", "true", "yes", "on"])
         elif plan in {"free_no_trial", "free_without_trial", "free_not_trial"}:
             # 只匹配已明确查询到“不具备 Plus 试用资格”的 free 账号；字段缺失表示资格未知，不命中。
             trial_expr = "lower(COALESCE(CAST(json_extract(payload, '$.plus_trial_eligible') AS TEXT), ''))"
@@ -744,6 +749,11 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
         return plan == "free" and bool(trial)
     if f in {"half_price", "plus_half_price", "half_price_trial"}:
         eligible = row.get("plus_half_price_eligible")
+        if isinstance(eligible, str):
+            eligible = eligible.strip().lower() in {"1", "true", "yes", "on"}
+        return plan == "free" and bool(eligible)
+    if f in {"zero_price", "plus_zero_price", "zero_price_trial"}:
+        eligible = row.get("plus_zero_price_eligible")
         if isinstance(eligible, str):
             eligible = eligible.strip().lower() in {"1", "true", "yes", "on"}
         return plan == "free" and bool(eligible)
@@ -1284,6 +1294,8 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
             row["plus_trial_duration_num_periods"] = result.get("plus_trial_duration_num_periods")
             row["plus_trial_duration_period"] = result.get("plus_trial_duration_period")
             row["plus_half_price_eligible"] = bool(result.get("plus_half_price_eligible"))
+            row["plus_zero_price_eligible"] = bool(result.get("plus_zero_price_eligible"))
+            row["plus_trial_offer_type"] = result.get("plus_trial_offer_type") or "none"
             row["eligible_offer_ids"] = result.get("eligible_offer_ids") or []
             row["plan_last_success_at"] = result.get("checked_at") or _now()
             row["plan_last_success_result_json"] = json.dumps(result, ensure_ascii=False)
@@ -1600,6 +1612,7 @@ def list_account_plan_check_statuses(
     fields = (
         "id", "email", "archived",
         "plan_type", "current_plan_type", "plus_trial_eligible", "plus_half_price_eligible",
+        "plus_zero_price_eligible", "plus_trial_offer_type",
         "plus_trial_campaign_id", "plus_trial_title", "plus_trial_discount_percentage",
         "plus_trial_duration_num_periods", "plus_trial_duration_period",
         "plan_check_status", "plan_check_ok", "plan_check_error",
@@ -1681,6 +1694,9 @@ def list_account_plan_check_statuses(
                     "current_plan_type": row.get("current_plan_type"),
                     "plan_type": row.get("plan_type"),
                     "plus_trial_eligible": row.get("plus_trial_eligible"),
+                    "plus_half_price_eligible": row.get("plus_half_price_eligible"),
+                    "plus_zero_price_eligible": row.get("plus_zero_price_eligible"),
+                    "plus_trial_offer_type": row.get("plus_trial_offer_type"),
                     "plus_half_price_eligible": row.get("plus_half_price_eligible"),
                     "momo_check_status": row.get("momo_check_status"),
                     "momo_check_ok": row.get("momo_check_ok"),

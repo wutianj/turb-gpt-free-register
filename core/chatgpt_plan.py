@@ -248,6 +248,21 @@ def parse_accounts_check(data: dict, *, token: str = "") -> dict:
         and plus_duration_periods > 0
         and plus_duration_period in {"month", "monthly"}
     )
+    plus_zero_price_eligible = bool(
+        plus_trial_eligible
+        and plus_discount_percentage == 100
+        and plus_duration_periods is not None
+        and plus_duration_periods > 0
+        and plus_duration_period in {"month", "monthly"}
+    )
+    if plus_zero_price_eligible:
+        plus_trial_offer_type = "zero_price"
+    elif plus_half_price_eligible:
+        plus_trial_offer_type = "half_price"
+    elif plus_trial_eligible:
+        plus_trial_offer_type = "other"
+    else:
+        plus_trial_offer_type = "none"
 
     offers = ((item.get("eligible_offers") or {}).get("offers") or [])
     eligible_offer_ids = [o.get("id") for o in offers if isinstance(o, dict) and o.get("id")]
@@ -283,6 +298,8 @@ def parse_accounts_check(data: dict, *, token: str = "") -> dict:
         "plus_trial_duration_num_periods": plus_duration_periods,
         "plus_trial_duration_period": duration.get("period"),
         "plus_half_price_eligible": plus_half_price_eligible,
+        "plus_zero_price_eligible": plus_zero_price_eligible,
+        "plus_trial_offer_type": plus_trial_offer_type,
         "plus_trial_promotion_type_label": plus_meta.get("promotion_type_label"),
         "eligible_offer_ids": eligible_offer_ids,
         "features_count": len(item.get("features") or []),

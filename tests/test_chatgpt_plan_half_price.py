@@ -25,10 +25,19 @@ def _response(discount=50, periods=1, period="month"):
 
 
 class HalfPriceOfferTests(unittest.TestCase):
+    def test_full_discount_is_classified_as_zero_price_trial(self):
+        result = parse_accounts_check(_response(discount=100, periods=1))
+        self.assertTrue(result["plus_trial_eligible"])
+        self.assertTrue(result["plus_zero_price_eligible"])
+        self.assertFalse(result["plus_half_price_eligible"])
+        self.assertEqual(result["plus_trial_offer_type"], "zero_price")
+
     def test_fifty_percent_plus_offer_is_detected_for_any_positive_month_count(self):
         result = parse_accounts_check(_response())
         self.assertTrue(result["plus_trial_eligible"])
         self.assertTrue(result["plus_half_price_eligible"])
+        self.assertFalse(result["plus_zero_price_eligible"])
+        self.assertEqual(result["plus_trial_offer_type"], "half_price")
 
         two_month_result = parse_accounts_check(_response(periods=2))
         self.assertEqual(two_month_result["plus_trial_duration_num_periods"], 2)

@@ -15,6 +15,7 @@ class AccountPlanFilterTests(unittest.TestCase):
             accounts_path = root / "accounts.json"
             accounts_path.write_text(json.dumps([
                 {"id": 1, "email": "eligible@example.com", "current_plan_type": "free", "plus_trial_eligible": True, "plus_half_price_eligible": True},
+                {"id": 6, "email": "zero-price@example.com", "current_plan_type": "free", "plus_trial_eligible": True, "plus_zero_price_eligible": True},
                 {"id": 2, "email": "not-eligible@example.com", "current_plan_type": "free", "plus_trial_eligible": False},
                 {"id": 3, "email": "paid@example.com", "current_plan_type": "plus", "plus_trial_eligible": True},
                 {"id": 4, "email": "missing-plan@example.com", "plus_trial_eligible": True},
@@ -33,10 +34,10 @@ class AccountPlanFilterTests(unittest.TestCase):
             ), patch.object(db, "_SQLITE_READY", False), patch.object(db, "_SQLITE_READY_PATH", None):
                 for filter_name in ("plus_trial", "plus_trial_eligible", "trial"):
                     result = db.list_accounts_page(limit=20, plan_filter=filter_name)
-                    self.assertEqual([item["id"] for item in result["items"]], [1])
+                    self.assertEqual([item["id"] for item in result["items"]], [6, 1])
 
                 free_result = db.list_accounts_page(limit=20, plan_filter="free")
-                self.assertEqual([item["id"] for item in free_result["items"]], [5, 2, 1])
+                self.assertEqual([item["id"] for item in free_result["items"]], [6, 5, 2, 1])
 
                 no_trial_result = db.list_accounts_page(limit=20, plan_filter="free_no_trial")
                 self.assertEqual([item["id"] for item in no_trial_result["items"]], [2])
@@ -45,17 +46,24 @@ class AccountPlanFilterTests(unittest.TestCase):
                     half_price_result = db.list_accounts_page(limit=20, plan_filter=filter_name)
                     self.assertEqual([item["id"] for item in half_price_result["items"]], [1])
 
+                for filter_name in ("zero_price", "plus_zero_price", "zero_price_trial"):
+                    zero_price_result = db.list_accounts_page(limit=20, plan_filter=filter_name)
+                    self.assertEqual([item["id"] for item in zero_price_result["items"]], [6])
+
                 snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="plus_trial")
-                self.assertEqual([item["id"] for item in snapshot["items"]], [1])
+                self.assertEqual([item["id"] for item in snapshot["items"]], [6, 1])
 
                 free_snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="free")
-                self.assertEqual([item["id"] for item in free_snapshot["items"]], [5, 2, 1])
+                self.assertEqual([item["id"] for item in free_snapshot["items"]], [6, 5, 2, 1])
 
                 no_trial_snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="free_no_trial")
                 self.assertEqual([item["id"] for item in no_trial_snapshot["items"]], [2])
 
                 half_price_snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="half_price")
                 self.assertEqual([item["id"] for item in half_price_snapshot["items"]], [1])
+
+                zero_price_snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="zero_price")
+                self.assertEqual([item["id"] for item in zero_price_snapshot["items"]], [6])
 
 
 if __name__ == "__main__":
