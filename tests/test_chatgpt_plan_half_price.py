@@ -30,6 +30,10 @@ class HalfPriceOfferTests(unittest.TestCase):
         self.assertTrue(result["plus_trial_eligible"])
         self.assertTrue(result["plus_half_price_eligible"])
 
+        two_month_result = parse_accounts_check(_response(periods=2))
+        self.assertEqual(two_month_result["plus_trial_duration_num_periods"], 2)
+        self.assertTrue(two_month_result["plus_half_price_eligible"])
+
         three_month_result = parse_accounts_check(_response(periods=3))
         self.assertEqual(three_month_result["plus_trial_duration_num_periods"], 3)
         self.assertTrue(three_month_result["plus_half_price_eligible"])
