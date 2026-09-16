@@ -476,6 +476,11 @@ def _account_filter_sql(
             where.append(f"{plan_expr} = ?")
             where.append(f"{trial_expr} IN (?, ?, ?, ?)")
             params.extend(["free", "1", "true", "yes", "on"])
+        elif plan in {"half_price", "plus_half_price", "half_price_trial"}:
+            half_price_expr = "lower(COALESCE(CAST(json_extract(payload, '$.plus_half_price_eligible') AS TEXT), ''))"
+            where.append(f"{plan_expr} = ?")
+            where.append(f"{half_price_expr} IN (?, ?, ?, ?)")
+            params.extend(["free", "1", "true", "yes", "on"])
         elif plan in {"free_no_trial", "free_without_trial", "free_not_trial"}:
             # 只匹配已明确查询到“不具备 Plus 试用资格”的 free 账号；字段缺失表示资格未知，不命中。
             trial_expr = "lower(COALESCE(CAST(json_extract(payload, '$.plus_trial_eligible') AS TEXT), ''))"
@@ -723,7 +728,7 @@ def _decorate_account(row: dict) -> dict:
 
 
 def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> bool:
-    """账号套餐过滤：支持已开通 Plus、可试用 Plus、不可试用 Plus 的 free 账号。"""
+    """账号套餐过滤：支持已开通、可试用、半价试用及不可试用 Plus。"""
     f = str(plan_filter or "").strip().lower()
     if not f or f in {"all", "any"}:
         return True
@@ -737,6 +742,11 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
         if isinstance(trial, str):
             trial = trial.strip().lower() in {"1", "true", "yes", "on"}
         return plan == "free" and bool(trial)
+    if f in {"half_price", "plus_half_price", "half_price_trial"}:
+        eligible = row.get("plus_half_price_eligible")
+        if isinstance(eligible, str):
+            eligible = eligible.strip().lower() in {"1", "true", "yes", "on"}
+        return plan == "free" and bool(eligible)
     if f in {"free_no_trial", "free_without_trial", "free_not_trial"}:
         if "plus_trial_eligible" not in row:
             return False

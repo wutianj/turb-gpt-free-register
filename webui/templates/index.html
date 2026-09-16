@@ -2255,6 +2255,7 @@
           <button type="button" class="acc-v2-toggle" id="showArchivedAccountsV2" aria-pressed="false" title="默认只显示未归档账号；开启后单独查看归档账号">查看归档</button>
           <button type="button" class="acc-v2-toggle" id="showPlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示已开通 Plus 的账号">已开通Plus</button>
           <button type="button" class="acc-v2-toggle" id="showPlusTrialAccountsOnlyV2" aria-pressed="false" title="只查询/显示当前为 free 且可试用 Plus 的账号">可试用Plus</button>
+          <button type="button" class="acc-v2-toggle" id="showHalfPriceAccountsOnlyV2" aria-pressed="false" title="只显示官方套餐查询明确返回 50% Plus 优惠的 free 账号">半价试用</button>
           <button type="button" class="acc-v2-toggle" id="showFreeAccountsOnlyV2" aria-pressed="false" title="只查询/显示已明确不能试用 Plus 的 free 账号；资格未知的账号不包含">free不可试用Plus</button>
           <label class="acc-v2-inline" title="按账号状态筛选账号">
             <select id="codexStatusFilterV2">
@@ -2642,6 +2643,7 @@ let OUTLOOK_TOTAL = 0;
 let SHOW_ARCHIVED_ACCOUNTS = false;
 let SHOW_PLUS_ACCOUNTS_ONLY = false;
 let SHOW_PLUS_TRIAL_ACCOUNTS_ONLY = false;
+let SHOW_HALF_PRICE_ACCOUNTS_ONLY = false;
 let SHOW_FREE_ACCOUNTS_ONLY = false;
 const ACCOUNT_SELECTED = new Set();
 const OUTLOOK_SELECTED = new Set();
@@ -3372,6 +3374,7 @@ function getCodexBulkWorkers() {
 }
 function getAccountsPlanFilter() {
   if (SHOW_PLUS_ACCOUNTS_ONLY) return 'plus';
+  if (SHOW_HALF_PRICE_ACCOUNTS_ONLY) return 'half_price';
   if (SHOW_PLUS_TRIAL_ACCOUNTS_ONLY) return 'plus_trial';
   if (SHOW_FREE_ACCOUNTS_ONLY) return 'free_no_trial';
   return '';
@@ -4209,10 +4212,12 @@ async function applyAccountsPlusFilter(on) {
   SHOW_PLUS_ACCOUNTS_ONLY = !!on;
   if (SHOW_PLUS_ACCOUNTS_ONLY) {
     SHOW_PLUS_TRIAL_ACCOUNTS_ONLY = false;
+    SHOW_HALF_PRICE_ACCOUNTS_ONLY = false;
     SHOW_FREE_ACCOUNTS_ONLY = false;
   }
   setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), SHOW_PLUS_ACCOUNTS_ONLY);
   setAccountsFilterToggle($('#showPlusTrialAccountsOnlyV2'), SHOW_PLUS_TRIAL_ACCOUNTS_ONLY);
+  setAccountsFilterToggle($('#showHalfPriceAccountsOnlyV2'), SHOW_HALF_PRICE_ACCOUNTS_ONLY);
   setAccountsFilterToggle($('#showFreeAccountsOnlyV2'), SHOW_FREE_ACCOUNTS_ONLY);
   ACCOUNT_SELECTED.clear();
   PAGERS.accounts.page = 1;
@@ -4223,10 +4228,28 @@ async function applyAccountsPlusTrialFilter(on) {
   SHOW_PLUS_TRIAL_ACCOUNTS_ONLY = !!on;
   if (SHOW_PLUS_TRIAL_ACCOUNTS_ONLY) {
     SHOW_PLUS_ACCOUNTS_ONLY = false;
+    SHOW_HALF_PRICE_ACCOUNTS_ONLY = false;
     SHOW_FREE_ACCOUNTS_ONLY = false;
   }
   setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), SHOW_PLUS_ACCOUNTS_ONLY);
   setAccountsFilterToggle($('#showPlusTrialAccountsOnlyV2'), SHOW_PLUS_TRIAL_ACCOUNTS_ONLY);
+  setAccountsFilterToggle($('#showHalfPriceAccountsOnlyV2'), SHOW_HALF_PRICE_ACCOUNTS_ONLY);
+  setAccountsFilterToggle($('#showFreeAccountsOnlyV2'), SHOW_FREE_ACCOUNTS_ONLY);
+  ACCOUNT_SELECTED.clear();
+  PAGERS.accounts.page = 1;
+  await loadAccounts();
+  await pollAccountPlanStatuses();
+}
+async function applyAccountsHalfPriceFilter(on) {
+  SHOW_HALF_PRICE_ACCOUNTS_ONLY = !!on;
+  if (SHOW_HALF_PRICE_ACCOUNTS_ONLY) {
+    SHOW_PLUS_ACCOUNTS_ONLY = false;
+    SHOW_PLUS_TRIAL_ACCOUNTS_ONLY = false;
+    SHOW_FREE_ACCOUNTS_ONLY = false;
+  }
+  setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), SHOW_PLUS_ACCOUNTS_ONLY);
+  setAccountsFilterToggle($('#showPlusTrialAccountsOnlyV2'), SHOW_PLUS_TRIAL_ACCOUNTS_ONLY);
+  setAccountsFilterToggle($('#showHalfPriceAccountsOnlyV2'), SHOW_HALF_PRICE_ACCOUNTS_ONLY);
   setAccountsFilterToggle($('#showFreeAccountsOnlyV2'), SHOW_FREE_ACCOUNTS_ONLY);
   ACCOUNT_SELECTED.clear();
   PAGERS.accounts.page = 1;
@@ -4238,9 +4261,11 @@ async function applyAccountsFreeFilter(on) {
   if (SHOW_FREE_ACCOUNTS_ONLY) {
     SHOW_PLUS_ACCOUNTS_ONLY = false;
     SHOW_PLUS_TRIAL_ACCOUNTS_ONLY = false;
+    SHOW_HALF_PRICE_ACCOUNTS_ONLY = false;
   }
   setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), SHOW_PLUS_ACCOUNTS_ONLY);
   setAccountsFilterToggle($('#showPlusTrialAccountsOnlyV2'), SHOW_PLUS_TRIAL_ACCOUNTS_ONLY);
+  setAccountsFilterToggle($('#showHalfPriceAccountsOnlyV2'), SHOW_HALF_PRICE_ACCOUNTS_ONLY);
   setAccountsFilterToggle($('#showFreeAccountsOnlyV2'), SHOW_FREE_ACCOUNTS_ONLY);
   ACCOUNT_SELECTED.clear();
   PAGERS.accounts.page = 1;
@@ -4296,6 +4321,10 @@ async function refreshAccountsList(btn) {
   const plusTrialV2 = $('#showPlusTrialAccountsOnlyV2');
   if (plusTrialV2) plusTrialV2.addEventListener('click', () => {
     applyAccountsPlusTrialFilter(!SHOW_PLUS_TRIAL_ACCOUNTS_ONLY);
+  });
+  const halfPriceV2 = $('#showHalfPriceAccountsOnlyV2');
+  if (halfPriceV2) halfPriceV2.addEventListener('click', () => {
+    applyAccountsHalfPriceFilter(!SHOW_HALF_PRICE_ACCOUNTS_ONLY);
   });
   const freeV2 = $('#showFreeAccountsOnlyV2');
   if (freeV2) freeV2.addEventListener('click', () => {

@@ -14,7 +14,7 @@ class AccountPlanFilterTests(unittest.TestCase):
             root = Path(td)
             accounts_path = root / "accounts.json"
             accounts_path.write_text(json.dumps([
-                {"id": 1, "email": "eligible@example.com", "current_plan_type": "free", "plus_trial_eligible": True},
+                {"id": 1, "email": "eligible@example.com", "current_plan_type": "free", "plus_trial_eligible": True, "plus_half_price_eligible": True},
                 {"id": 2, "email": "not-eligible@example.com", "current_plan_type": "free", "plus_trial_eligible": False},
                 {"id": 3, "email": "paid@example.com", "current_plan_type": "plus", "plus_trial_eligible": True},
                 {"id": 4, "email": "missing-plan@example.com", "plus_trial_eligible": True},
@@ -41,6 +41,10 @@ class AccountPlanFilterTests(unittest.TestCase):
                 no_trial_result = db.list_accounts_page(limit=20, plan_filter="free_no_trial")
                 self.assertEqual([item["id"] for item in no_trial_result["items"]], [2])
 
+                for filter_name in ("half_price", "plus_half_price", "half_price_trial"):
+                    half_price_result = db.list_accounts_page(limit=20, plan_filter=filter_name)
+                    self.assertEqual([item["id"] for item in half_price_result["items"]], [1])
+
                 snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="plus_trial")
                 self.assertEqual([item["id"] for item in snapshot["items"]], [1])
 
@@ -49,6 +53,9 @@ class AccountPlanFilterTests(unittest.TestCase):
 
                 no_trial_snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="free_no_trial")
                 self.assertEqual([item["id"] for item in no_trial_snapshot["items"]], [2])
+
+                half_price_snapshot = db.list_account_plan_check_statuses(limit=20, plan_filter="half_price")
+                self.assertEqual([item["id"] for item in half_price_snapshot["items"]], [1])
 
 
 if __name__ == "__main__":
