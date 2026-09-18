@@ -1582,6 +1582,14 @@ function _totpAction(r) {
   if (status === 'queued' || status === 'running') {
     return `<span class="pill status-running">${status === 'queued' ? '排队中' : '开启中'}</span>`;
   }
+  if (status === 'failed' || status === 'stopped' || status === 'banned') {
+    const label = status === 'stopped' ? '已停止' : '失败';
+    const tip = r.totp_setup_error || r.totp_setup_message || '重新开启 2FA';
+    const retry = r.has_access_token
+      ? `<button type="button" class="twofa-action" data-account-totp-setup="${esc(r.id)}" title="${esc(tip)}">重新开启</button>`
+      : '';
+    return `<span class="pill status-failed" title="${esc(tip)}">${label}</span>${retry}`;
+  }
   if (!r.has_access_token) {
     return `<span class="muted">无Token</span>`;
   }

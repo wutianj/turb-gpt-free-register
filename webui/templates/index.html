@@ -3489,6 +3489,13 @@ function _totpCellV2(r) {
     const label = status === 'queued' ? '排队中' : '开启中';
     return `<div class="agent-token-cell"><span class="pill status-running"${titleAttr}>${label}</span></div>`;
   }
+  if (['failed', 'stopped', 'banned'].includes(status)) {
+    const label = status === 'stopped' ? '已停止' : '失败';
+    const retry = r.has_access_token
+      ? `<button type="button" class="acc-v2-twofa-btn" data-account-totp-setup="${esc(r.id)}" title="${esc(titleText || '重新开启 2FA')}">重新开启</button>`
+      : '';
+    return `<div class="agent-token-cell"><span class="pill status-failed"${titleAttr}>${label}</span>${retry}</div>`;
+  }
   const btnTitle = titleText ? ` title="${esc(titleText)}"` : ` title="为该账号开启 2FA，并把 TOTP 密钥写回账号信息"`;
   const btn = r.has_access_token
     ? `<button type="button" class="acc-v2-twofa-btn" data-account-totp-setup="${esc(r.id)}"${btnTitle}>开启2FA</button>`
